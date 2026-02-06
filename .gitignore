@@ -20,6 +20,11 @@ venv/
 # Build files
 dist/
 
+# project-specific files
+browser_profiles/
+data-output/
+downloads/
+
 # Data files
 *.gif
 *.txt
