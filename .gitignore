@@ -29,6 +29,8 @@ dist/
 *.jsonl
 *.log
 *.bak
+data-output/
+downloads/
 
 # Secrets and sensitive files
 secrets.env
@@ -43,6 +45,7 @@ AgentHistoryList.json
 private_example.py
 private_example
 CLAUDE.local.md
+browser_profiles/
 
 uv.lock
 temp
