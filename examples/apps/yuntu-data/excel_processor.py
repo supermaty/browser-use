@@ -1,13 +1,18 @@
 """
 Excel处理模块 - 读取下载的Excel文件并计算指标
 """
+from __future__ import annotations
+
 import re
 import pandas as pd
 from pathlib import Path
-from typing import Optional, Any
+from typing import TYPE_CHECKING
 
-from data_models import KOLContentReview, AdFlowReview
+from data_models import KOLContentReview, AdFlowReview, ProjectOverview
 from utils import find_downloaded_excel_files, identify_excel_file_type, parse_number
+
+if TYPE_CHECKING:
+	from data_models import YuntuDataReport
 
 
 def _normalize_date_to_yyyymmdd(value: str) -> int:
@@ -114,7 +119,7 @@ def sum_search_count_from_downloads(
 	)
 
 
-def read_kol_content_excel(file_path: Path | str) -> dict[str, Any]:
+def read_kol_content_excel(file_path: Path | str) -> dict:
 	"""
 	读取达人及内容复盘Excel文件
 	
@@ -189,7 +194,7 @@ def read_kol_content_excel(file_path: Path | str) -> dict[str, Any]:
 		}
 
 
-def read_ad_flow_excel(file_path: Path | str) -> dict[str, Any]:
+def read_ad_flow_excel(file_path: Path | str) -> dict:
 	"""
 	读取投流数据精细化复盘Excel文件
 	
@@ -250,8 +255,8 @@ def read_ad_flow_excel(file_path: Path | str) -> dict[str, Any]:
 
 def process_downloaded_excel_files(
 	downloads_path: str | Path,
-	report: Any  # YuntuDataReport类型，但避免循环导入
-) -> tuple[Optional[KOLContentReview], Optional[AdFlowReview]]:
+	report: "YuntuDataReport",
+) -> tuple[KOLContentReview | None, AdFlowReview | None]:
 	"""
 	处理下载的Excel文件，更新报告中的达人内容和投流数据
 	
@@ -301,7 +306,7 @@ def process_downloaded_excel_files(
 	return kol_content_review, ad_flow_review
 
 
-def calculate_metrics(project_overview: Any) -> dict[str, float | None]:
+def calculate_metrics(project_overview: ProjectOverview | None) -> dict[str, float | None]:
 	"""
 	根据项目整体数据计算成本指标
 	

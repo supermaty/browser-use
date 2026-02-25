@@ -19,19 +19,6 @@ EXCEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 TASKS_BASE_DIR = Path(OUTPUT_BASE_DIR) / 'tasks'
 TASKS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Excel文件命名规则
-def generate_excel_filename(brand_name: str | None = None, report_name: str | None = None) -> str:
-	"""生成Excel文件名"""
-	from datetime import datetime
-	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-	brand = brand_name or "未知品牌"
-	report = report_name or "未知报告"
-	# 清理文件名中的非法字符
-	import re
-	brand = re.sub(r'[<>:"/\\|?*]', '_', brand)
-	report = re.sub(r'[<>:"/\\|?*]', '_', report)
-	return f"{brand}_{report}_{timestamp}.xlsx"
-
 # Project Root and Profile Path
 # Assuming this file is in examples/apps/yuntu-data/
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -252,8 +239,9 @@ HEYONE_PROMPT_TEMPLATE = """
                 "搜索次数": 100000
             },
             "5A人群资产": {
-                "投后人群规模": 100000,
-                "投后人群增长率": "0.1%",
+                "拉新人群规模": 100000,
+                "拉新比例": "0.1%",
+                "拉新比例(行业TOP5%品牌均值)": "0.1%",
                 "A1流转人群": 100000,
                 "A1流转率": "0.1%",
                 "A2流转人群": 100000,

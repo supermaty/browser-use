@@ -10,16 +10,33 @@ Excel导出模块 - 将整合后的数据导出为格式化的Excel文件
 - 模板模式（优先）：按 template_structure 分析结果固定行列写入，不依赖运行时搜索表头。
 - 标准模式（回退）：完全由代码生成多 sheet 报表。若模板不存在则自动回退。
 """
+from __future__ import annotations
+
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Any
+from typing import Any
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.worksheet.worksheet import Worksheet
 
-from data_models import YuntuDataReport
+from data_models import (
+	YuntuDataReport,
+	ProjectOverview,
+	A5AssetFlow,
+	KOLContentReview,
+	SearchInsight,
+	AdFlowReview,
+	TAPortraitReview,
+)
 from utils import format_percentage
+
+# ---------------------------------------------------------------------------
+# 公共样式常量
+# ---------------------------------------------------------------------------
+_HEADER_FILL = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+_HEADER_FONT = Font(bold=True, color="FFFFFF", size=12)
+_HEADER_ALIGNMENT = Alignment(horizontal="center", vertical="center")
 
 # ---------------------------------------------------------------------------
 # 模板布局：来自 docs/【黑玩】赛马复盘0105.xlsx 的 template_structure 分析结果，
@@ -50,10 +67,67 @@ TEMPLATE_OVERALL_COLUMNS: list[tuple[int, str, str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# 公共辅助函数
+# ---------------------------------------------------------------------------
+
+
+def _apply_header_style(ws: Worksheet, row: int = 1) -> None:
+	"""对指定行的所有已有单元格应用标准表头样式。"""
+	for cell in ws[row]:
+		cell.fill = _HEADER_FILL
+		cell.font = _HEADER_FONT
+		cell.alignment = _HEADER_ALIGNMENT
+
+
+def _create_sheet_with_rows(
+	wb: Workbook,
+	sheet_name: str,
+	headers: list[str],
+	rows: list[tuple[str, Any]],
+	col_widths: list[int] | None = None,
+	position: int | None = None,
+) -> Worksheet:
+	"""
+	创建含表头 + 数据行的 sheet（消除样板代码）。
+
+	Args:
+		wb: 目标 Workbook
+		sheet_name: sheet 名称
+		headers: 表头列名列表
+		rows: [(label, value), ...] 数据行
+		col_widths: 各列宽度（与 headers 等长），None 则使用默认宽度
+		position: sheet 插入位置（None 则追加到末尾）
+	"""
+	ws = wb.create_sheet(sheet_name, position) if position is not None else wb.create_sheet(sheet_name)
+	for col_idx, header in enumerate(headers, start=1):
+		ws.cell(row=1, column=col_idx, value=header)
+	_apply_header_style(ws)
+
+	for row_idx, row_data in enumerate(rows, start=2):
+		for col_idx, value in enumerate(row_data, start=1):
+			cell = ws.cell(row=row_idx, column=col_idx, value=value if value is not None else "N/A")
+			# 数值列右对齐
+			if col_idx > 1:
+				cell.alignment = Alignment(horizontal="right")
+
+	if col_widths:
+		from openpyxl.utils import get_column_letter
+		for i, width in enumerate(col_widths, start=1):
+			ws.column_dimensions[get_column_letter(i)].width = width
+
+	return ws
+
+
+# ---------------------------------------------------------------------------
+# 入口函数
+# ---------------------------------------------------------------------------
+
+
 def export_to_excel(
 	report: YuntuDataReport | list[YuntuDataReport],
 	output_dir: Path | str,
-	filename: Optional[str] = None,
+	filename: str | None = None,
 	template_path: Path | str | None = None,
 ) -> Path:
 	"""
@@ -123,6 +197,11 @@ def export_to_excel(
 	return file_path
 
 
+# ---------------------------------------------------------------------------
+# 模板模式
+# ---------------------------------------------------------------------------
+
+
 def _export_with_template(
 	reports: list[YuntuDataReport],
 	template_path: Path,
@@ -148,40 +227,46 @@ def _export_with_template(
 	wb.save(output_path)
 
 
-def _create_overview_multi_sheet(wb: Workbook, reports: list[YuntuDataReport]) -> None:
-	"""标准模式多报告：创建「总体数据表现」sheet，表头行+多数据行（每行一份报告）。"""
-	ws = wb.create_sheet("总体数据表现", 0)
-	header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-	header_font = Font(bold=True, color="FFFFFF", size=12)
-	for col_1based, _source, attr in TEMPLATE_OVERALL_COLUMNS:
-		cell = ws.cell(row=TEMPLATE_OVERALL_HEADER_ROW, column=col_1based, value=attr)
-		cell.fill = header_fill
-		cell.font = header_font
+def _fill_overview_by_layout(ws: Worksheet, report: YuntuDataReport, data_row: int = TEMPLATE_OVERALL_FIRST_DATA_ROW) -> None:
+	"""按固定行列将单份报告的 ProjectOverview 填入「总体数据表现」的指定行。"""
+	project = report.项目整体
+	if not project:
+		return
+	for col_1based, source, attr in TEMPLATE_OVERALL_COLUMNS:
+		if source == "meta":
+			value = getattr(report, attr, None)
+		elif source == "project":
+			value = getattr(project, attr, None)
+		else:
+			value = None
+		if value is None:
+			continue
+		ws.cell(row=data_row, column=col_1based, value=value)
+
+
+def _fill_overview_multi_by_layout(ws: Worksheet, reports: list[YuntuDataReport]) -> None:
+	"""多份报告时，从 TEMPLATE_OVERALL_FIRST_DATA_ROW 起每行填一份报告。"""
 	for i, report in enumerate(reports):
 		_fill_overview_by_layout(ws, report, data_row=TEMPLATE_OVERALL_FIRST_DATA_ROW + i)
 
 
-def _create_project_overview_sheet(wb: Workbook, data: any) -> None:
+def _create_overview_multi_sheet(wb: Workbook, reports: list[YuntuDataReport]) -> None:
+	"""标准模式多报告：创建「总体数据表现」sheet，表头行+多数据行（每行一份报告）。"""
+	ws = wb.create_sheet("总体数据表现", 0)
+	for col_1based, _source, attr in TEMPLATE_OVERALL_COLUMNS:
+		ws.cell(row=TEMPLATE_OVERALL_HEADER_ROW, column=col_1based, value=attr)
+	_apply_header_style(ws, row=TEMPLATE_OVERALL_HEADER_ROW)
+	for i, report in enumerate(reports):
+		_fill_overview_by_layout(ws, report, data_row=TEMPLATE_OVERALL_FIRST_DATA_ROW + i)
+
+
+# ---------------------------------------------------------------------------
+# 标准模式 - 各 Sheet 创建
+# ---------------------------------------------------------------------------
+
+
+def _create_project_overview_sheet(wb: Workbook, data: ProjectOverview) -> None:
 	"""创建项目整体Overview sheet"""
-	ws = wb.create_sheet("项目整体", 0)
-	
-	# 设置标题样式
-	header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-	header_font = Font(bold=True, color="FFFFFF", size=12)
-	header_alignment = Alignment(horizontal="center", vertical="center")
-	
-	# 写入标题
-	ws['A1'] = "指标"
-	ws['B1'] = "数值"
-	ws['C1'] = "单位/说明"
-	
-	# 应用标题样式
-	for cell in ws[1]:
-		cell.fill = header_fill
-		cell.font = header_font
-		cell.alignment = header_alignment
-	
-	# 数据行
 	rows = [
 		("消耗金额", data.消耗金额, "元"),
 		("曝光次数", data.曝光次数, "次"),
@@ -205,58 +290,14 @@ def _create_project_overview_sheet(wb: Workbook, data: any) -> None:
 		("CP5A", data.CP5A, "元/5A人群"),
 		("ROI", data.ROI, "倍"),
 	]
-	
-	for idx, (label, value, unit) in enumerate(rows, start=2):
-		ws[f'A{idx}'] = label
-		ws[f'B{idx}'] = value if value is not None else "N/A"
-		ws[f'C{idx}'] = unit
-		ws[f'B{idx}'].alignment = Alignment(horizontal="right")
-	
-	# 调整列宽
-	ws.column_dimensions['A'].width = 20
-	ws.column_dimensions['B'].width = 20
-	ws.column_dimensions['C'].width = 15
+	_create_sheet_with_rows(
+		wb, "项目整体", ["指标", "数值", "单位/说明"],
+		rows, col_widths=[20, 20, 15], position=0,
+	)
 
 
-def _fill_overview_by_layout(ws: Any, report: YuntuDataReport, data_row: int = TEMPLATE_OVERALL_FIRST_DATA_ROW) -> None:
-	"""按固定行列将单份报告的 ProjectOverview 填入「总体数据表现」的指定行。"""
-	project = report.项目整体
-	if not project:
-		return
-	for col_1based, source, attr in TEMPLATE_OVERALL_COLUMNS:
-		if source == "meta":
-			value = getattr(report, attr, None)
-		elif source == "project":
-			value = getattr(project, attr, None)
-		else:
-			value = None
-		if value is None:
-			continue
-		ws.cell(row=data_row, column=col_1based, value=value)
-
-
-def _fill_overview_multi_by_layout(ws: Any, reports: list[YuntuDataReport]) -> None:
-	"""多份报告时，从 TEMPLATE_OVERALL_FIRST_DATA_ROW 起每行填一份报告。"""
-	for i, report in enumerate(reports):
-		_fill_overview_by_layout(ws, report, data_row=TEMPLATE_OVERALL_FIRST_DATA_ROW + i)
-
-
-def _create_a5_asset_flow_sheet(wb: Workbook, data: any) -> None:
+def _create_a5_asset_flow_sheet(wb: Workbook, data: A5AssetFlow) -> None:
 	"""创建5A人群资产流转 sheet"""
-	ws = wb.create_sheet("5A人群资产流转")
-	
-	# 标题
-	header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-	header_font = Font(bold=True, color="FFFFFF", size=12)
-	
-	ws['A1'] = "指标"
-	ws['B1'] = "数值"
-	
-	for cell in ws[1]:
-		cell.fill = header_fill
-		cell.font = header_font
-		cell.alignment = Alignment(horizontal="center", vertical="center")
-	
 	rows = [
 		("投后人群规模", data.投后人群规模),
 		("投后增长率", format_percentage(data.投后增长率) if data.投后增长率 else None),
@@ -271,31 +312,14 @@ def _create_a5_asset_flow_sheet(wb: Workbook, data: any) -> None:
 		("A5新增量级", data.A5新增量级),
 		("A5流转率", format_percentage(data.A5流转率) if data.A5流转率 else None),
 	]
-	
-	for idx, (label, value) in enumerate(rows, start=2):
-		ws[f'A{idx}'] = label
-		ws[f'B{idx}'] = value if value is not None else "N/A"
-		ws[f'B{idx}'].alignment = Alignment(horizontal="right")
-	
-	ws.column_dimensions['A'].width = 20
-	ws.column_dimensions['B'].width = 20
+	_create_sheet_with_rows(
+		wb, "5A人群资产流转", ["指标", "数值"],
+		rows, col_widths=[20, 20],
+	)
 
 
-def _create_kol_content_sheet(wb: Workbook, data: any) -> None:
+def _create_kol_content_sheet(wb: Workbook, data: KOLContentReview) -> None:
 	"""创建达人及内容复盘 sheet"""
-	ws = wb.create_sheet("达人及内容复盘")
-	
-	ws['A1'] = "项目"
-	ws['B1'] = "内容"
-	
-	header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-	header_font = Font(bold=True, color="FFFFFF", size=12)
-	
-	for cell in ws[1]:
-		cell.fill = header_fill
-		cell.font = header_font
-		cell.alignment = Alignment(horizontal="center", vertical="center")
-	
 	rows = [
 		("Excel文件路径", data.excel_file_path or "未下载"),
 		("是否已下载", "是" if data.excel_downloaded else "否"),
@@ -303,104 +327,60 @@ def _create_kol_content_sheet(wb: Workbook, data: any) -> None:
 		("爆文率", format_percentage(data.爆文率) if data.爆文率 else None),
 		("看后搜索率", format_percentage(data.看后搜索率) if data.看后搜索率 else None),
 	]
-	
-	for idx, (label, value) in enumerate(rows, start=2):
-		ws[f'A{idx}'] = label
-		ws[f'B{idx}'] = value if value is not None else "N/A"
-	
-	ws.column_dimensions['A'].width = 20
-	ws.column_dimensions['B'].width = 50
+	_create_sheet_with_rows(
+		wb, "达人及内容复盘", ["项目", "内容"],
+		rows, col_widths=[20, 50],
+	)
 
 
-def _create_search_insight_sheet(wb: Workbook, data: any) -> None:
+def _create_search_insight_sheet(wb: Workbook, data: SearchInsight) -> None:
 	"""创建搜索与溢出价值 sheet"""
-	ws = wb.create_sheet("搜索与溢出价值")
-	
-	ws['A1'] = "指标"
-	ws['B1'] = "数值"
-	
-	header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-	header_font = Font(bold=True, color="FFFFFF", size=12)
-	
-	for cell in ws[1]:
-		cell.fill = header_fill
-		cell.font = header_font
-		cell.alignment = Alignment(horizontal="center", vertical="center")
-	
 	rows = [
 		("SOV（声量份额）", data.SOV),
 		("搜索人数变化趋势", format_percentage(data.搜索人数变化趋势) if data.搜索人数变化趋势 else None),
 		("搜索次数变化趋势", format_percentage(data.搜索次数变化趋势) if data.搜索次数变化趋势 else None),
 	]
-	
-	for idx, (label, value) in enumerate(rows, start=2):
-		ws[f'A{idx}'] = label
-		ws[f'B{idx}'] = value if value is not None else "N/A"
-		ws[f'B{idx}'].alignment = Alignment(horizontal="right")
-	
-	ws.column_dimensions['A'].width = 25
-	ws.column_dimensions['B'].width = 20
+	_create_sheet_with_rows(
+		wb, "搜索与溢出价值", ["指标", "数值"],
+		rows, col_widths=[25, 20],
+	)
 
 
-def _create_ad_flow_sheet(wb: Workbook, data: any) -> None:
+def _create_ad_flow_sheet(wb: Workbook, data: AdFlowReview) -> None:
 	"""创建投流数据精细化复盘 sheet"""
-	ws = wb.create_sheet("投流数据精细化复盘")
-	
-	ws['A1'] = "项目"
-	ws['B1'] = "内容"
-	
-	header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-	header_font = Font(bold=True, color="FFFFFF", size=12)
-	
-	for cell in ws[1]:
-		cell.fill = header_fill
-		cell.font = header_font
-		cell.alignment = Alignment(horizontal="center", vertical="center")
-	
 	rows = [
 		("Excel文件路径", data.excel_file_path or "未下载"),
 		("是否已下载", "是" if data.excel_downloaded else "否"),
 		("投放A3流转率", format_percentage(data.投放A3流转率) if data.投放A3流转率 else None),
 		("人群精准度", format_percentage(data.人群精准度) if data.人群精准度 else None),
 	]
-	
-	for idx, (label, value) in enumerate(rows, start=2):
-		ws[f'A{idx}'] = label
-		ws[f'B{idx}'] = value if value is not None else "N/A"
-	
-	ws.column_dimensions['A'].width = 20
-	ws.column_dimensions['B'].width = 50
+	_create_sheet_with_rows(
+		wb, "投流数据精细化复盘", ["项目", "内容"],
+		rows, col_widths=[20, 50],
+	)
 
 
-def _create_ta_portrait_sheet(wb: Workbook, data: any) -> None:
+def _create_ta_portrait_sheet(wb: Workbook, data: TAPortraitReview) -> None:
 	"""创建TA人群画像精准度复盘 sheet"""
 	ws = wb.create_sheet("TA人群画像")
-	
-	ws['A1'] = "人群类型"
-	ws['B1'] = "画像类型"
-	ws['C1'] = "内容"
-	
-	header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-	header_font = Font(bold=True, color="FFFFFF", size=12)
-	
-	for cell in ws[1]:
-		cell.fill = header_fill
-		cell.font = header_font
-		cell.alignment = Alignment(horizontal="center", vertical="center")
-	
+	for col_idx, header in enumerate(["人群类型", "画像类型", "内容"], start=1):
+		ws.cell(row=1, column=col_idx, value=header)
+	_apply_header_style(ws)
+
 	rows = [
 		("全触达人群", "基础画像", str(data.全触达人群基础画像) if data.全触达人群基础画像 else "N/A"),
 		("全触达人群", "内容偏好", str(data.全触达人群内容偏好) if data.全触达人群内容偏好 else "N/A"),
 		("投后A3人群", "基础画像", str(data.投后A3人群基础画像) if data.投后A3人群基础画像 else "N/A"),
 		("投后A3人群", "内容偏好", str(data.投后A3人群内容偏好) if data.投后A3人群内容偏好 else "N/A"),
 	]
-	
+
 	for idx, (crowd, portrait_type, content) in enumerate(rows, start=2):
-		ws[f'A{idx}'] = crowd
-		ws[f'B{idx}'] = portrait_type
-		ws[f'C{idx}'] = content
-		ws[f'C{idx}'].alignment = Alignment(wrap_text=True, vertical="top")
-	
+		ws.cell(row=idx, column=1, value=crowd)
+		ws.cell(row=idx, column=2, value=portrait_type)
+		cell = ws.cell(row=idx, column=3, value=content)
+		cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+	from openpyxl.utils import get_column_letter
 	ws.column_dimensions['A'].width = 15
 	ws.column_dimensions['B'].width = 15
 	ws.column_dimensions['C'].width = 60
@@ -409,12 +389,11 @@ def _create_ta_portrait_sheet(wb: Workbook, data: any) -> None:
 def _create_summary_sheet(wb: Workbook, report: YuntuDataReport) -> None:
 	"""创建汇总sheet"""
 	ws = wb.create_sheet("汇总", 0)
-	
+
 	# 标题
-	title_font = Font(bold=True, size=16)
 	ws['A1'] = "数据报告汇总"
-	ws['A1'].font = title_font
-	
+	ws['A1'].font = Font(bold=True, size=16)
+
 	# 基本信息
 	ws['A3'] = "报告名称："
 	ws['B3'] = report.报告名称 or "N/A"
@@ -422,19 +401,12 @@ def _create_summary_sheet(wb: Workbook, report: YuntuDataReport) -> None:
 	ws['B4'] = report.品牌名称 or "N/A"
 	ws['A5'] = "日期范围："
 	ws['B5'] = report.日期范围 or "N/A"
-	
+
 	# 数据模块状态
 	ws['A7'] = "数据模块"
 	ws['B7'] = "状态"
-	
-	header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-	header_font = Font(bold=True, color="FFFFFF", size=12)
-	
-	for cell in ws[7]:
-		cell.fill = header_fill
-		cell.font = header_font
-		cell.alignment = Alignment(horizontal="center", vertical="center")
-	
+	_apply_header_style(ws, row=7)
+
 	modules = [
 		("项目整体", report.项目整体 is not None),
 		("5A人群资产流转", report.五A人群资产流转 is not None),
@@ -443,10 +415,10 @@ def _create_summary_sheet(wb: Workbook, report: YuntuDataReport) -> None:
 		("投流数据精细化复盘", report.投流数据精细化复盘 is not None),
 		("TA人群画像精准度复盘", report.TA人群画像精准度复盘 is not None),
 	]
-	
+
 	for idx, (module_name, has_data) in enumerate(modules, start=8):
 		ws[f'A{idx}'] = module_name
 		ws[f'B{idx}'] = "✓ 已提取" if has_data else "✗ 未提取"
-	
+
 	ws.column_dimensions['A'].width = 25
 	ws.column_dimensions['B'].width = 15

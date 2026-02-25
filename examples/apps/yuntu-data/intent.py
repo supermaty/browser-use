@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import json
-from typing import Optional, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 from browser_use.llm.google import ChatGoogle
@@ -16,44 +18,44 @@ INSIGHT_DATE_TYPE = Literal["按周", "按月", "近7天", "近30天", "自定�
 class InsightTimeRange(BaseModel):
     """行业搜索洞察的单个时间范围"""
     date_range_type: INSIGHT_DATE_TYPE
-    insight_date_range: Optional[str] = Field(None, description="自定义/按周/按月时的具体日期范围字符串")
+    insight_date_range: str | None = Field(None, description="自定义/按周/按月时的具体日期范围字符串")
 
 
 class BrandCategory(BaseModel):
     """黑玩品牌案例：单个品牌分类，含星图/竞价报告名及各自消耗金额"""
-    category_name: Optional[str] = Field(None, description="品牌分类名称（可选），如「洗护」「美发」")
-    report_name_star: Optional[str] = Field(None, description="该分类的星图（达人营销）报告名")
-    consumption_amount_star: Optional[float] = Field(None, description="该分类星图报告消耗金额（元），必填")
-    report_name_bid: Optional[str] = Field(None, description="该分类的竞价（竞价投放）报告名")
-    consumption_amount_bid: Optional[float] = Field(None, description="该分类竞价报告消耗金额（元），必填")
+    category_name: str | None = Field(None, description="品牌分类名称（可选），如「洗护」「美发」")
+    report_name_star: str | None = Field(None, description="该分类的星图（达人营销）报告名")
+    consumption_amount_star: float | None = Field(None, description="该分类星图报告消耗金额（元），必填")
+    report_name_bid: str | None = Field(None, description="该分类的竞价（竞价投放）报告名")
+    consumption_amount_bid: float | None = Field(None, description="该分类竞价报告消耗金额（元），必填")
 
 
 class YuntuTask(BaseModel):
-    report_name: Optional[str] = Field(None, description="单个报告名（非黑玩多分类时使用）")
-    brand_categories: Optional[list[BrandCategory]] = Field(
+    report_name: str | None = Field(None, description="单个报告名（非黑玩多分类时使用）")
+    brand_categories: list[BrandCategory] | None = Field(
         None,
         description="黑玩品牌案例：多个品牌分类，每分类含星图报告名+消耗金额、竞价报告名+消耗金额；与 report_name 二选一",
     )
     # 爆文加热时间（第五步 达人及内容复盘）：单值
-    kol_content_date_type: Optional[KOL_CONTENT_DATE_TYPE] = Field(
+    kol_content_date_type: KOL_CONTENT_DATE_TYPE | None = Field(
         None,
         description="爆文加热时间类型：实时｜按周｜按月｜近7天｜近30天；用于第五步达人及内容复盘",
     )
-    kol_content_date_range: Optional[str] = Field(
+    kol_content_date_range: str | None = Field(
         None,
         description="爆文加热时间范围（按周/按月/自定义时的具体值）；实时/近7天/近30天可为 null",
     )
     # 行业搜索洞察（第六步）：一到多值（行业使用系统默认，不抽取）
-    insight_time_ranges: Optional[list[InsightTimeRange]] = Field(
+    insight_time_ranges: list[InsightTimeRange] | None = Field(
         None,
         description="行业搜索洞察的一到多个时间范围；每项含 date_range_type(按周|按月|近7天|近30天|自定义) 与 insight_date_range",
     )
-    brand_name: Optional[str] = Field(None, description="The brand name related to the task")
-    consumption_amount_star: Optional[float] = Field(
+    brand_name: str | None = Field(None, description="The brand name related to the task")
+    consumption_amount_star: float | None = Field(
         None,
         description="星图（达人营销）消耗金额（元）；单报告模式时必填；品牌分类模式时由各分类内 consumption_amount_star 提供",
     )
-    consumption_amount_bid: Optional[float] = Field(
+    consumption_amount_bid: float | None = Field(
         None,
         description="竞价（竞价投放）消耗金额（元）；单报告模式时必填；品牌分类模式时由各分类内 consumption_amount_bid 提供",
     )

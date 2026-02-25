@@ -1,9 +1,10 @@
 """
 工具函数 - 辅助数据处理和文件操作
 """
+from __future__ import annotations
+
 import re
 from pathlib import Path
-from typing import Optional
 from datetime import datetime, timedelta
 
 
@@ -201,3 +202,16 @@ def identify_excel_file_type(file_path: Path) -> str | None:
 		return 'ad_flow'
 	
 	return None
+
+
+def generate_excel_filename(brand_name: str | None = None, report_name: str | None = None) -> str:
+	"""生成Excel文件名"""
+	from datetime import datetime
+	timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+	brand = brand_name or "未知品牌"
+	report = report_name or "未知报告"
+	# 清理文件名中的非法字符
+	import re
+	brand = re.sub(r'[<>:"/\\|?*]', '_', brand)
+	report = re.sub(r'[<>:"/\\|?*]', '_', report)
+	return f"{brand}_{report}_{timestamp}.xlsx"
