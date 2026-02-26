@@ -1,95 +1,93 @@
 # Yuntu Data Scraper (巨量云图数据助手)
 
-A Gradio-based application for extracting data from Yuntu (巨量云图) using Browser Use and Gemini 3 Pro.
+基于 Browser Use + Gradio 的云图数据抓取应用。  
+当前代码主链路是：自然语言任务 -> 意图提取 -> Agent 执行 -> JSON 导出。
 
-## Features
+## 当前状态（按最新代码）
 
-- **Chat Interface**: Natural language task descriptions
-- **Intent Recognition**: Automatic extraction of report name, date range, and brand
-- **Persistent Login**: Browser profile saved to `browser_profiles/yuntu_profile`
-- **Brand-Specific Templates**: Special handling for Heyone (黑玩)
-- **Excel Export**: Automatically extracts data, processes downloaded Excel files, and generates formatted Excel reports
-- **Data Processing**: Reads Excel files for KOL content review and ad flow analysis, calculates metrics (CPM, CPE, CPS, CPA3, ROI)
+### Done
 
-## Requirements
+- `Done` 聊天式任务输入与执行（Gradio UI）
+- `Done` 意图识别（报告名、品牌、时间范围、消耗金额等）
+- `Done` 登录态复用与首次手动登录引导
+- `Done` 黑玩品牌专用提示词模板与多分类任务输入
+- `Done` Agent 实时日志回显（步骤、动作、提取内容）
+- `Done` 任务隔离目录输出（`data-output/tasks/task_时间戳/`）
+- `Done` Agent 原始输出 JSON 导出
+- `Done` 结构化数据 JSON 导出（Pydantic 模型）
+- `Done` 回搜次数 Tool（按日期区间从下载的 Excel 累加搜索次数）
+
+### Pending
+
+- `Pending` 下载 Excel 的自动解析结果接入主流程（`excel_processor.py` 尚未在 pipeline 主链路中调用）
+- `Pending` 指标计算（CPM/CPE/CPS/CPA3/ROI）接入主流程
+- `Pending` 模板化 Excel 结果导出接入主流程（`excel_exporter.py` 已实现但未接入 pipeline）
+- `Pending` 文档中部分“已实现 Excel 全流程”描述与实际代码完全对齐
+
+## 环境要求
 
 - Python 3.11+
-- `GOOGLE_API_KEY` environment variable set
+- `.env` 中配置 `GOOGLE_API_KEY`
 
-## Installation
+## 安装
 
 ```bash
-# From project root
-# Install all dependencies including Excel processing libraries (pandas, openpyxl)
+# 在仓库根目录执行
 uv sync --all-extras
 
-# Or if you only need code dependencies
+# 或仅安装代码相关依赖
 uv sync --extra code
 ```
 
-## Usage
+## 运行
 
 ```bash
-# Run the application
 python examples/apps/yuntu-data/app.py
 ```
 
-Then open your browser to the displayed URL (typically `http://127.0.0.1:7860`).
+启动后访问：`http://127.0.0.1:7860`
 
-## Example Task
+## 示例任务
 
+```text
+从巨量云图获取黑玩复盘数据，报告名：ZY-Heyone12.1-12.31；
+星图 10万、竞价 20万；
+爆文加热：近30天；
+行业搜索洞察：自定义（2025/12/01-2025/12/31）
 ```
-从巨量云图中帮我获取一下黑玩的复盘数据，报告名：ZY-Heyone12.1-12.31；行业搜索洞察的日期范围是：自定义（2025/12/01-2025/12/31）
-```
 
-## Intent Fields
+## 首次运行说明
 
-The system extracts the following from your task description:
+如果未检测到可用登录信息，应用会：
 
-| Field | Description | Example |
-|-------|-------------|---------|
-| `report_name` | Name of the report | ZY-SHK12.1-12.31 |
-| `brand_name` | Brand name (optional) | 黑玩 |
-| `date_range_type` | Type of date selection | 近7天, 近30天, 自定义, 按周, 按月 |
-| `insight_date_range` | Specific date range | 2025/12/01-2025/12/31 |
+1. 打开浏览器并进入云图登录页
+2. 等待你手动登录
+3. 保存浏览器 Profile 到 `browser_profiles/yuntu_profile`
+4. 后续任务复用登录态
 
-## First Run
+## 输出产物（当前版本）
 
-On first run, if no login profile exists, the application will:
+每次任务默认写入独立目录：`data-output/tasks/task_YYYYMMDD_HHMMSS/`
 
-1. Open a browser window
-2. Navigate to the Yuntu login page
-3. Wait for you to manually log in
-4. Save your session for future runs
+- `agent_output.json`：Agent 的原始 `final_result` 与 `extracted_content`
+- `<品牌>_<报告>_<时间戳>.json`：从 Agent 输出中解析的 JSON（或 raw_text 兜底）
+- `structured_data_<时间戳>.json`：结构化后的 `YuntuDataReport` 列表
+- `conversations/`：对话与执行过程记录
+- 任务内下载文件：Agent 下载的 Excel 等文件
 
-## Output Files
+## 配置项（`config.py`）
 
-After running a task, the system will:
+- `GEMINI_MODEL`（当前默认：`gemini-3-pro-preview`）
+- `YUNTU_LOGIN_URL`
+- `BROWSER_PROFILE_DIR`（可通过 `.env` 覆盖）
+- `BROWSER_DOWNLOADS_PATH`（可通过 `.env` 覆盖）
+- 黑玩/通用品牌提示词模板
 
-1. Extract structured data from Agent execution results
-2. Process downloaded Excel files (KOL content review, ad flow analysis)
-3. Calculate metrics (CPM, CPE, CPS, CPA3, ROI)
-4. Generate a formatted Excel report with multiple sheets:
-   - 项目整体 (Project Overview)
-   - 5A人群资产流转 (5A Asset Flow)
-   - 达人及内容复盘 (KOL Content Review)
-   - 搜索与溢出价值 (Search Insight)
-   - 投流数据精细化复盘 (Ad Flow Review)
-   - TA人群画像精准度复盘 (TA Portrait Review)
-   - 汇总 (Summary)
+## 参考链接
 
-Excel reports are saved to `data-output/excel_exports/` directory.
-
-## Configuration
-
-Edit `config.py` to customize:
-
-- `GEMINI_MODEL`: The Gemini model to use (default: `gemini-3-pro-preview`)
-- `YUNTU_LOGIN_URL`: The login URL
-- `EXCEL_OUTPUT_DIR`: Excel report output directory
-- `DOWNLOADS_PATH`: Directory for downloaded Excel files
-- Prompt templates for different brands
-
-## Optional: Update Prompts
-
-For better accuracy, you can manually read the Word document (`docs/复盘路径拆解.docx`) and update the prompt templates in `config.py` based on the detailed data extraction paths.
+1. 黑玩复盘最终项目结果 sample Excel：  
+https://k74u68pb5x.feishu.cn/wiki/KC10wNnjtiNndHk5SiQc34FunYc?sheet=Y7UCNB
+2. 黑玩复盘数据获取 SOP 路径：  
+https://k74u68pb5x.feishu.cn/wiki/I26owf0fdiRujlkFhMVcJsD8nHb
+3. 巨量云图网站地址：  
+https://yuntu.oceanengine.com/yuntu_brand/ecom/home/overview?aadvid=1804155605152852
