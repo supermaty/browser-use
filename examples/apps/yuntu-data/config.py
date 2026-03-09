@@ -20,7 +20,7 @@ TASKS_BASE_DIR = Path(OUTPUT_BASE_DIR) / 'tasks'
 TASKS_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Project Root and Profile Path
-# Assuming this file is in examples/apps/yuntu-data/
+# This file is in examples/apps/yuntu-data-opt/
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 # 如果 .env 中配置了绝对路径, 直接使用；否则使用项目根目录下的相对路径
@@ -50,7 +50,7 @@ DOWNLOADS_PATH = os.getenv(
 Path(DOWNLOADS_PATH).expanduser().mkdir(parents=True, exist_ok=True)
 
 # Models
-GEMINI_MODEL = "gemini-3-pro-preview"
+GEMINI_MODEL = "gemini-3-flash-preview"
 
 # URLs
 YUNTU_LOGIN_URL = "https://yuntu.oceanengine.com/account/login" # Adjust if necessary, main entry point

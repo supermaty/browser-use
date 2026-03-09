@@ -8,6 +8,7 @@ __pycache__/
 .pytest_cache/
 .ipynb_checkpoints
 ~/
+.pre-commit-cache/
 
 # Virtual Environments
 .venv*

@@ -1322,20 +1322,42 @@ class BrowserSession(BaseModel):
 				self.logger.debug('⚠️ Cached browser state has 0 interactive elements, fetching fresh state')
 				# Fall through to fetch fresh state
 
-		# Dispatch the event and wait for result
-		event: BrowserStateRequestEvent = cast(
-			BrowserStateRequestEvent,
-			self.event_bus.dispatch(
-				BrowserStateRequestEvent(
-					include_dom=True,
-					include_screenshot=include_screenshot,
-					include_recent_events=include_recent_events,
-				)
-			),
+		request_event = BrowserStateRequestEvent(
+			include_dom=True,
+			include_screenshot=include_screenshot,
+			include_recent_events=include_recent_events,
 		)
 
-		# The handler returns the BrowserStateSummary directly
-		result = await event.event_result(raise_if_none=True, raise_if_any=True)
+		# Dispatch the event and wait for result
+		event: BrowserStateRequestEvent = cast(BrowserStateRequestEvent, self.event_bus.dispatch(request_event))
+
+		try:
+			# The handler returns the BrowserStateSummary directly
+			result = await event.event_result(raise_if_none=True, raise_if_any=True)
+		except RuntimeError as e:
+			error_text = str(e)
+			if 'Expected at least one handler to return a non-None result' not in error_text:
+				raise
+
+			self.logger.warning(
+				'BrowserStateRequestEvent had no non-None handler result. '
+				'Retrying once and falling back to DOMWatchdog direct call if needed.'
+			)
+
+			# Retry once through event bus first
+			retry_event: BrowserStateRequestEvent = cast(BrowserStateRequestEvent, self.event_bus.dispatch(request_event))
+			try:
+				result = await retry_event.event_result(raise_if_none=True, raise_if_any=True)
+			except RuntimeError as retry_error:
+				if 'Expected at least one handler to return a non-None result' not in str(retry_error):
+					raise
+
+				# Final fallback: call DOMWatchdog directly when available
+				dom_watchdog = getattr(self, '_dom_watchdog', None)
+				if dom_watchdog is None:
+					raise
+				result = await dom_watchdog.on_BrowserStateRequestEvent(request_event)
+
 		assert result is not None and result.dom_state is not None
 		return result
 

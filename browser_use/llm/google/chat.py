@@ -1,7 +1,9 @@
-import asyncio
+﻿import asyncio
+import ast
 import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, overload
@@ -154,6 +156,128 @@ class ChatGoogle(BaseChatModel):
 	def name(self) -> str:
 		return str(self.model)
 
+	def _strip_markdown_fence(self, text: str) -> str:
+		clean = (text or '').strip()
+		if clean.startswith('```json') and clean.endswith('```'):
+			return clean[7:-3].strip()
+		if clean.startswith('```') and clean.endswith('```'):
+			return clean[3:-3].strip()
+		return clean
+
+	def _extract_balanced_json_fragments(self, text: str) -> list[str]:
+		"""
+		Extract balanced top-level JSON object/array fragments from mixed text.
+		"""
+		fragments: list[str] = []
+		start_idx = -1
+		stack: list[str] = []
+		in_string = False
+		escape = False
+
+		for idx, ch in enumerate(text):
+			if in_string:
+				if escape:
+					escape = False
+				elif ch == '\\':
+					escape = True
+				elif ch == '"':
+					in_string = False
+				continue
+
+			if ch == '"':
+				in_string = True
+				continue
+
+			if ch in '{[':
+				if not stack:
+					start_idx = idx
+				stack.append(ch)
+				continue
+
+			if ch in '}]' and stack:
+				open_ch = stack[-1]
+				if (open_ch == '{' and ch == '}') or (open_ch == '[' and ch == ']'):
+					stack.pop()
+					if not stack and start_idx >= 0:
+						fragment = text[start_idx : idx + 1].strip()
+						if fragment:
+							fragments.append(fragment)
+						start_idx = -1
+		return fragments
+
+	def _repair_json_candidate(self, text: str) -> str:
+		"""
+		Lightweight JSON repairs:
+		- remove trailing commas
+		- quote unquoted keys after { or ,
+		- normalize Python booleans/null spellings
+		"""
+		fixed = text.lstrip('\ufeff').strip()
+		fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+		fixed = re.sub(r'([{\[,]\s*)([^\s"\'{}\[\],:]+)(\s*:)', r'\1"\2"\3', fixed)
+		fixed = re.sub(r'\bNone\b', 'null', fixed)
+		fixed = re.sub(r'\bTrue\b', 'true', fixed)
+		fixed = re.sub(r'\bFalse\b', 'false', fixed)
+		return fixed
+
+	def _parse_json_like_text(self, text: str) -> Any:
+		"""
+		Parse JSON-like model output with lightweight repairs:
+		1) direct JSON parse
+		2) balanced fragment extraction from mixed text
+		3) Python literal fallback for single-quoted dict/list
+		4) lightweight repair then JSON parse
+		"""
+		raw = self._strip_markdown_fence(text)
+		candidates: list[str] = []
+		if raw:
+			candidates.append(raw)
+
+		start_obj = raw.find('{')
+		end_obj = raw.rfind('}')
+		if start_obj >= 0 and end_obj > start_obj:
+			candidates.append(raw[start_obj : end_obj + 1].strip())
+
+		start_arr = raw.find('[')
+		end_arr = raw.rfind(']')
+		if start_arr >= 0 and end_arr > start_arr:
+			candidates.append(raw[start_arr : end_arr + 1].strip())
+		candidates.extend(self._extract_balanced_json_fragments(raw))
+
+		ordered_candidates: list[str] = []
+		seen: set[str] = set()
+		for item in candidates:
+			key = item.strip()
+			if not key or key in seen:
+				continue
+			seen.add(key)
+			ordered_candidates.append(key)
+
+		last_error: Exception | None = None
+		for candidate in ordered_candidates:
+			try:
+				return json.loads(candidate)
+			except Exception as exc:  # noqa: BLE001
+				last_error = exc
+
+		for candidate in ordered_candidates:
+			try:
+				literal = ast.literal_eval(candidate)
+				if isinstance(literal, (dict, list)):
+					return literal
+			except Exception as exc:  # noqa: BLE001
+				last_error = exc
+
+		for candidate in ordered_candidates:
+			repaired = self._repair_json_candidate(candidate)
+			try:
+				return json.loads(repaired)
+			except Exception as exc:  # noqa: BLE001
+				last_error = exc
+
+		preview = re.sub(r'\s+', ' ', raw)[:240]
+		raise ValueError(f'Unable to parse JSON-like text. preview={preview!r}, last_error={last_error}')
+
 	def _get_stop_reason(self, response: types.GenerateContentResponse) -> str | None:
 		"""Extract stop_reason from Google response."""
 		if hasattr(response, 'candidates') and response.candidates:
@@ -243,12 +367,12 @@ class ChatGoogle(BaseChatModel):
 
 		async def _make_api_call():
 			start_time = time.time()
-			self.logger.debug(f'🚀 Starting API call to {self.model}')
+			self.logger.debug(f'馃殌 Starting API call to {self.model}')
 
 			try:
 				if output_format is None:
 					# Return string response
-					self.logger.debug('📄 Requesting text response')
+					self.logger.debug('馃搫 Requesting text response')
 
 					response = await self.get_client().aio.models.generate_content(
 						model=self.model,
@@ -257,12 +381,12 @@ class ChatGoogle(BaseChatModel):
 					)
 
 					elapsed = time.time() - start_time
-					self.logger.debug(f'✅ Got text response in {elapsed:.2f}s')
+					self.logger.debug(f'鉁?Got text response in {elapsed:.2f}s')
 
 					# Handle case where response.text might be None
 					text = response.text or ''
 					if not text:
-						self.logger.warning('⚠️ Empty text response received')
+						self.logger.warning('鈿狅笍 Empty text response received')
 
 					usage = self._get_usage(response)
 
@@ -276,7 +400,7 @@ class ChatGoogle(BaseChatModel):
 					# Handle structured output
 					if self.supports_structured_output:
 						# Use native JSON mode
-						self.logger.debug(f'🔧 Requesting structured output for {output_format.__name__}')
+						self.logger.debug(f'馃敡 Requesting structured output for {output_format.__name__}')
 						config['response_mime_type'] = 'application/json'
 						# Convert Pydantic model to Gemini-compatible schema
 						optimized_schema = SchemaOptimizer.create_gemini_optimized_schema(output_format)
@@ -291,13 +415,13 @@ class ChatGoogle(BaseChatModel):
 						)
 
 						elapsed = time.time() - start_time
-						self.logger.debug(f'✅ Got structured response in {elapsed:.2f}s')
+						self.logger.debug(f'鉁?Got structured response in {elapsed:.2f}s')
 
 						usage = self._get_usage(response)
 
 						# Handle case where response.parsed might be None
 						if response.parsed is None:
-							self.logger.debug('📝 Parsing JSON from text response')
+							self.logger.debug('馃摑 Parsing JSON from text response')
 							# When using response_schema, Gemini returns JSON as text
 							if response.text:
 								try:
@@ -305,20 +429,20 @@ class ChatGoogle(BaseChatModel):
 									text = response.text.strip()
 									if text.startswith('```json') and text.endswith('```'):
 										text = text[7:-3].strip()
-										self.logger.debug('🔧 Stripped ```json``` wrapper from response')
+										self.logger.debug('馃敡 Stripped ```json``` wrapper from response')
 									elif text.startswith('```') and text.endswith('```'):
 										text = text[3:-3].strip()
-										self.logger.debug('🔧 Stripped ``` wrapper from response')
+										self.logger.debug('馃敡 Stripped ``` wrapper from response')
 
 									# Parse the JSON text and validate with the Pydantic model
-									parsed_data = json.loads(text)
+									parsed_data = self._parse_json_like_text(response.text)
 									return ChatInvokeCompletion(
 										completion=output_format.model_validate(parsed_data),
 										usage=usage,
 										stop_reason=self._get_stop_reason(response),
 									)
-								except (json.JSONDecodeError, ValueError) as e:
-									self.logger.error(f'❌ Failed to parse JSON response: {str(e)}')
+								except (ValueError, SyntaxError) as e:
+									self.logger.error(f'鉂?Failed to parse JSON response: {str(e)}')
 									self.logger.debug(f'Raw response text: {response.text[:200]}...')
 									raise ModelProviderError(
 										message=f'Failed to parse or validate response {response}: {str(e)}',
@@ -326,7 +450,7 @@ class ChatGoogle(BaseChatModel):
 										model=self.model,
 									) from e
 							else:
-								self.logger.error('❌ No response text received')
+								self.logger.error('鉂?No response text received')
 								raise ModelProviderError(
 									message=f'No response from model {response}',
 									status_code=500,
@@ -349,7 +473,7 @@ class ChatGoogle(BaseChatModel):
 							)
 					else:
 						# Fallback: Request JSON in the prompt for models without native JSON mode
-						self.logger.debug(f'🔄 Using fallback JSON mode for {output_format.__name__}')
+						self.logger.debug(f'馃攧 Using fallback JSON mode for {output_format.__name__}')
 						# Create a copy of messages to modify
 						modified_messages = [m.model_copy(deep=True) for m in messages]
 
@@ -375,7 +499,7 @@ class ChatGoogle(BaseChatModel):
 						)
 
 						elapsed = time.time() - start_time
-						self.logger.debug(f'✅ Got fallback response in {elapsed:.2f}s')
+						self.logger.debug(f'鉁?Got fallback response in {elapsed:.2f}s')
 
 						usage = self._get_usage(response)
 
@@ -392,14 +516,14 @@ class ChatGoogle(BaseChatModel):
 									text = text[3:-3].strip()
 
 								# Parse and validate
-								parsed_data = json.loads(text)
+								parsed_data = self._parse_json_like_text(response.text)
 								return ChatInvokeCompletion(
 									completion=output_format.model_validate(parsed_data),
 									usage=usage,
 									stop_reason=self._get_stop_reason(response),
 								)
-							except (json.JSONDecodeError, ValueError) as e:
-								self.logger.error(f'❌ Failed to parse fallback JSON: {str(e)}')
+							except (ValueError, SyntaxError) as e:
+								self.logger.error(f'鉂?Failed to parse fallback JSON: {str(e)}')
 								self.logger.debug(f'Raw response text: {response.text[:200]}...')
 								raise ModelProviderError(
 									message=f'Model does not support JSON mode and failed to parse JSON from text response: {str(e)}',
@@ -407,7 +531,7 @@ class ChatGoogle(BaseChatModel):
 									model=self.model,
 								) from e
 						else:
-							self.logger.error('❌ No response text in fallback mode')
+							self.logger.error('鉂?No response text in fallback mode')
 							raise ModelProviderError(
 								message='No response from model',
 								status_code=500,
@@ -415,7 +539,7 @@ class ChatGoogle(BaseChatModel):
 							)
 			except Exception as e:
 				elapsed = time.time() - start_time
-				self.logger.error(f'💥 API call failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
+				self.logger.error(f'馃挜 API call failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
 				# Re-raise the exception
 				raise
 
@@ -433,7 +557,7 @@ class ChatGoogle(BaseChatModel):
 					jitter = random.uniform(0, delay * 0.1)  # 10% jitter
 					total_delay = delay + jitter
 					self.logger.warning(
-						f'⚠️ Got {e.status_code} error, retrying in {total_delay:.1f}s... (attempt {attempt + 1}/{self.max_retries})'
+						f'鈿狅笍 Got {e.status_code} error, retrying in {total_delay:.1f}s... (attempt {attempt + 1}/{self.max_retries})'
 					)
 					await asyncio.sleep(total_delay)
 					continue
@@ -553,3 +677,4 @@ class ChatGoogle(BaseChatModel):
 			return obj
 
 		return clean_schema(schema)
+

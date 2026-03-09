@@ -810,6 +810,14 @@ class DownloadsWatchdog(BaseWatchdog):
 		start_time = asyncio.get_event_loop().time()
 
 		while asyncio.get_event_loop().time() - start_time < max_wait:
+			# If another path already handled this download, stop polling quietly.
+			info = self._cdp_downloads_info.get(guid, {})
+			if info.get('handled'):
+				self.logger.debug(
+					'[DownloadsWatchdog] Download already handled by another path; skipping fallback polling'
+				)
+				return
+
 			await asyncio.sleep(5.0)  # Check every 5 seconds
 
 			if Path(downloads_dir).exists():
@@ -852,6 +860,14 @@ class DownloadsWatchdog(BaseWatchdog):
 								return
 						except Exception as e:
 							self.logger.debug(f'[DownloadsWatchdog] Error checking file {file_path}: {e}')
+
+		# Another branch may have completed and marked this guid while polling ended.
+		info = self._cdp_downloads_info.get(guid, {})
+		if info.get('handled'):
+			self.logger.debug(
+				f'[DownloadsWatchdog] Download handled for {suggested_filename}; suppressing timeout warning'
+			)
+			return
 
 		self.logger.warning(f'[DownloadsWatchdog] Download did not complete within {max_wait} seconds')
 
