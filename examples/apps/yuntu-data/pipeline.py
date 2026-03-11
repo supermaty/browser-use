@@ -30,6 +30,7 @@ from validator import validate_intent
 from browser_use import Agent, Browser
 from browser_use.llm.google import ChatGoogle
 from completeness import check_completeness
+from excel_processor import sum_search_count_from_excel
 from schemas import (
     FieldExtractionResult,
     FileDownloadResult,
@@ -262,6 +263,103 @@ class OptTaskPipeline:
                 return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
             return f"{_norm(tokens[0])} ~ {_norm(tokens[1])}"
         return text
+
+    @staticmethod
+    def _extract_period_from_text(text: str | None) -> tuple[str, str] | None:
+        src = str(text or "").strip()
+        if not src:
+            return None
+        m = re.search(
+            r"(\d{4}[./-]\d{1,2}[./-]\d{1,2})\s*(?:至|~|—|-)\s*(\d{4}[./-]\d{1,2}[./-]\d{1,2})",
+            src,
+        )
+        if not m:
+            return None
+
+        def _norm(tok: str) -> str:
+            y, mo, d = re.split(r"[./-]", tok)
+            return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+
+        return _norm(m.group(1)), _norm(m.group(2))
+
+    @classmethod
+    def _extract_report_period_map(cls, extracted_contents: list[Any] | None) -> dict[str, tuple[str, str]]:
+        out: dict[str, tuple[str, str]] = {}
+        for entry in extracted_contents or []:
+            payload = cls._parse_json_payload(entry)
+            if not payload or str(payload.get("type") or "") != "open_report_result":
+                continue
+            report_name = str(payload.get("report_name") or "").strip()
+            report_norm = cls._normalize_report_name_key(report_name)
+            if not report_norm:
+                continue
+
+            direct_period = cls._extract_period_from_text(str(payload.get("calculation_period") or ""))
+            if direct_period is not None:
+                out[report_norm] = direct_period
+                continue
+
+            click_obj = payload.get("click")
+            if isinstance(click_obj, dict):
+                click_period = cls._extract_period_from_text(str(click_obj.get("calculation_period") or ""))
+                if click_period is not None:
+                    out[report_norm] = click_period
+                    continue
+
+            candidates: list[str] = []
+            if isinstance(click_obj, dict):
+                candidates.append(str(click_obj.get("matched_report") or ""))
+                candidates.append(str(click_obj.get("matched_row_text") or ""))
+
+            for attempt in payload.get("attempts") or []:
+                if not isinstance(attempt, dict):
+                    continue
+                attempt_click = attempt.get("click")
+                if not isinstance(attempt_click, dict):
+                    continue
+                attempt_period = cls._extract_period_from_text(str(attempt_click.get("calculation_period") or ""))
+                if attempt_period is not None:
+                    out[report_norm] = attempt_period
+                    break
+                candidates.append(str(attempt_click.get("matched_report") or ""))
+                candidates.append(str(attempt_click.get("matched_row_text") or ""))
+                for row in attempt_click.get("candidate_reports") or []:
+                    candidates.append(str(row or ""))
+
+            if report_norm in out:
+                continue
+
+            best: tuple[str, str] | None = None
+            for cand in candidates:
+                if not cand:
+                    continue
+                period = cls._extract_period_from_text(cand)
+                if not period:
+                    continue
+                if report_name and cls._normalize_report_name_key(report_name) not in cls._normalize_report_name_key(cand):
+                    if best is None:
+                        best = period
+                    continue
+                best = period
+                break
+            if best is not None:
+                out[report_norm] = best
+        return out
+
+    @classmethod
+    def _sync_period_map_to_intent(cls, task_intent: YuntuTask | None, period_map: dict[str, tuple[str, str]] | None) -> None:
+        if task_intent is None or not period_map:
+            return
+        try:
+            normalized = {k: f"{v[0]} ~ {v[1]}" for k, v in period_map.items()}
+            task_intent.report_period_map = normalized
+            if task_intent.report_name:
+                report_norm = cls._normalize_report_name_key(task_intent.report_name)
+                if report_norm and report_norm in period_map:
+                    s, e = period_map[report_norm]
+                    task_intent.current_report_period = f"{s} ~ {e}"
+        except Exception:
+            pass
 
     @classmethod
     def _split_extract_query_fields(cls, query: str) -> list[str]:
@@ -826,6 +924,218 @@ class OptTaskPipeline:
         return None
 
     @staticmethod
+    def _to_numeric(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace(",", "").replace("，", "")
+        m = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not m:
+            return None
+        try:
+            num = float(m.group(0))
+        except Exception:
+            return None
+        if "%" in str(value):
+            return num / 100.0
+        return num
+
+    @staticmethod
+    def _safe_div(numerator: float | None, denominator: float | None) -> float | None:
+        if numerator is None or denominator is None:
+            return None
+        if abs(denominator) < 1e-12:
+            return None
+        return numerator / denominator
+
+    @classmethod
+    def _resolve_actual_consumption_for_report(
+        cls,
+        task_intent: YuntuTask | None,
+        report_name: str | None,
+    ) -> float | None:
+        if task_intent is None:
+            return None
+        target = cls._normalize_report_name_key(report_name)
+        if not target:
+            return None
+
+        categories = list(getattr(task_intent, "brand_categories", None) or [])
+        for category in categories:
+            star_name = str(getattr(category, "report_name_star", "") or "").strip()
+            bid_name = str(getattr(category, "report_name_bid", "") or "").strip()
+            star_norm = cls._normalize_report_name_key(star_name)
+            bid_norm = cls._normalize_report_name_key(bid_name)
+            if star_norm and (star_norm == target or star_norm in target or target in star_norm):
+                amt = getattr(category, "consumption_amount_star", None)
+                return float(amt) if amt is not None else None
+            if bid_norm and (bid_norm == target or bid_norm in target or target in bid_norm):
+                amt = getattr(category, "consumption_amount_bid", None)
+                return float(amt) if amt is not None else None
+
+        report_text = str(report_name or "")
+        star_amt = getattr(task_intent, "consumption_amount_star", None)
+        bid_amt = getattr(task_intent, "consumption_amount_bid", None)
+        if "星图" in report_text and star_amt is not None:
+            return float(star_amt)
+        if "竞价" in report_text and bid_amt is not None:
+            return float(bid_amt)
+        if star_amt is not None and bid_amt is None:
+            return float(star_amt)
+        if bid_amt is not None and star_amt is None:
+            return float(bid_amt)
+        return None
+
+    @classmethod
+    def _pick_first_module_payload(cls, row: dict[str, Any], labels: list[str]) -> dict[str, Any] | None:
+        for label in labels:
+            payload = row.get(label)
+            if isinstance(payload, dict):
+                return payload
+        return None
+
+    @classmethod
+    def _apply_computed_metrics_for_report_row(
+        cls,
+        *,
+        row: dict[str, Any],
+        report_name: str | None,
+        task_intent: YuntuTask | None,
+        report_period_map: dict[str, tuple[str, str]] | None = None,
+        output_dir: Path | None = None,
+    ) -> None:
+        actual_spend = cls._resolve_actual_consumption_for_report(task_intent, report_name)
+
+        overview_key = "项目整体Overview"
+        overview = row.get(overview_key)
+        if not isinstance(overview, dict):
+            overview = {}
+        row[overview_key] = overview
+
+        flow = cls._pick_first_module_payload(row, ["5A人群资产流转", "5A人群资产流转-触点口径"])
+
+        exposure_count = cls._to_numeric(overview.get("曝光次数"))
+        interaction_rate = cls._to_numeric(overview.get("互动率"))
+        completion_rate = cls._to_numeric(overview.get("完播率"))
+        interaction_count = cls._to_numeric(overview.get("互动量")) or cls._to_numeric(overview.get("互动次数"))
+        conversion_amount = cls._to_numeric(overview.get("本次活动转化金额")) or cls._to_numeric(overview.get("转化金额"))
+
+        a3_count = None
+        if isinstance(flow, dict):
+            a3_count = cls._to_numeric(flow.get("A3流转人数")) or cls._to_numeric(flow.get("A3流转人群"))
+        if a3_count is None:
+            a3_count = cls._to_numeric(overview.get("A3流转人数")) or cls._to_numeric(overview.get("A3流转人群"))
+
+        cpm = None
+        cpe = None
+        cps = None
+        cpa3 = None
+        roi = None
+        interaction_count_calc = None
+        completion_count_calc = None
+        if exposure_count is not None and interaction_rate is not None:
+            interaction_count_calc = exposure_count * interaction_rate
+        if exposure_count is not None and completion_rate is not None:
+            completion_count_calc = exposure_count * completion_rate
+        if interaction_count is None and interaction_count_calc is not None:
+            interaction_count = interaction_count_calc
+
+        search_count = cls._to_numeric(overview.get("回搜次数"))
+        if search_count is None:
+            period: tuple[str, str] | None = None
+            report_norm = cls._normalize_report_name_key(report_name)
+            if report_period_map and report_norm:
+                period = report_period_map.get(report_norm)
+            if period is not None:
+                start_date, end_date = period
+                row["计算周期"] = f"{start_date} ~ {end_date}"
+                print(f"[计算周期]: {start_date} ~ {end_date}")
+                search_file_path: str | None = None
+                files = overview.get("files")
+                if isinstance(files, list):
+                    for fp in files:
+                        candidate = str(fp or "").strip()
+                        if candidate.lower().endswith((".csv", ".xlsx", ".xls")):
+                            search_file_path = candidate
+                            break
+
+                if not search_file_path and output_dir and output_dir.exists():
+                    candidates = sorted(
+                        [
+                            p
+                            for p in output_dir.glob("**/*")
+                            if p.is_file() and p.suffix.lower() in {".csv", ".xlsx", ".xls"}
+                        ],
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    for p in candidates:
+                        name = p.name.lower()
+                        if any(token in name for token in ("搜索", "趋势", "search")):
+                            search_file_path = str(p)
+                            break
+                    if not search_file_path and candidates:
+                        search_file_path = str(candidates[0])
+
+                if search_file_path:
+                    try:
+                        summed = sum_search_count_from_excel(search_file_path, start_date, end_date)
+                        search_count = float(summed)
+                        overview["回搜次数"] = int(summed)
+                        print(
+                            "[search_count_calc]",
+                            {
+                                "report_name": report_name,
+                                "period": f"{start_date} ~ {end_date}",
+                                "file_path": search_file_path,
+                                "total_search_count": int(summed),
+                            },
+                        )
+                    except Exception:
+                        print(
+                            "[search_count_calc_failed]",
+                            {
+                                "report_name": report_name,
+                                "period": f"{start_date} ~ {end_date}",
+                                "file_path": search_file_path,
+                            },
+                        )
+            else:
+                print(
+                    "[search_count_period_missing]",
+                    {"report_name": report_name, "report_norm": report_norm},
+                )
+
+        if actual_spend is not None:
+            cpm = cls._safe_div(actual_spend * 1000.0, exposure_count)
+            cpe = cls._safe_div(actual_spend, interaction_count)
+            cps = cls._safe_div(actual_spend, search_count)
+            cpa3 = cls._safe_div(actual_spend, a3_count)
+            roi = cls._safe_div(conversion_amount, actual_spend)
+            overview["实际消耗金额"] = round(actual_spend, 6)
+
+        if interaction_count_calc is not None:
+            overview["互动次数"] = int(round(interaction_count_calc))
+            if "互动量" not in overview:
+                overview["互动量"] = int(round(interaction_count_calc))
+        if completion_count_calc is not None:
+            overview["完播数"] = int(round(completion_count_calc))
+        if cpm is not None:
+            overview["CPM"] = round(cpm, 6)
+        if cpe is not None:
+            overview["CPE"] = round(cpe, 6)
+        if cps is not None:
+            overview["CPS"] = round(cps, 6)
+        if cpa3 is not None:
+            overview["CPA3"] = round(cpa3, 6)
+        if roi is not None:
+            overview["ROI"] = round(roi, 6)
+
+    @staticmethod
     def _module_business_payload(module: ModuleExecutionResult) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         field_values: dict[str, Any] = {}
@@ -861,6 +1171,8 @@ class OptTaskPipeline:
         structured_output: YuntuAgentStructuredOutput,
         profile,
         task_intent: YuntuTask | None,
+        report_period_map: dict[str, tuple[str, str]] | None = None,
+        output_dir: Path | None = None,
     ) -> dict[str, Any]:
         report_targets = cls._build_report_targets(task_intent) if task_intent is not None else []
         structured_output = cls._ensure_report_targets_in_structured_output(structured_output, report_targets)
@@ -923,6 +1235,13 @@ class OptTaskPipeline:
                 if module_payload:
                     row[spec.label] = module_payload
 
+            cls._apply_computed_metrics_for_report_row(
+                row=row,
+                report_name=report.report_name,
+                task_intent=task_intent,
+                report_period_map=report_period_map,
+                output_dir=output_dir,
+            )
             report_rows.append(row)
 
         return {"结案报告": report_rows}
@@ -1071,6 +1390,8 @@ class OptTaskPipeline:
             report_targets=report_targets,
             hint_text=hint_text,
         )
+        report_period_map = cls._extract_report_period_map(extracted_contents)
+        cls._sync_period_map_to_intent(task_intent, report_period_map)
 
         partial_structured_path = output_dir / "agent_structured_output.partial.json"
         partial_structured_path.write_text(structured_output.model_dump_json(indent=2), encoding="utf-8")
@@ -1079,6 +1400,8 @@ class OptTaskPipeline:
             structured_output=structured_output,
             profile=profile,
             task_intent=task_intent,
+            report_period_map=report_period_map,
+            output_dir=output_dir,
         )
         business_summary = cls._merge_business_summary_with_progress(output_dir, business_summary)
         cls._update_report_progress_map(output_dir, business_summary)
@@ -1940,6 +2263,8 @@ class OptTaskPipeline:
         hover_eval_seen_by_stage: set[int] = set()
         extract_signature_seen_by_stage: dict[int, set[str]] = {}
         pending_click_target: str | None = None
+        pending_click_retry_count: int = 0
+        recent_success_click_targets: list[str] = []
         allowed_actions_in_report = {
             "click_in_content",
             "select_in_content",
@@ -1966,6 +2291,7 @@ class OptTaskPipeline:
             "dropdown_options",
         }
         report_modules = [m for m in (getattr(profile, "module_specs", None) or []) if getattr(m, "requires_report", False)]
+        all_modules = list(getattr(profile, "module_specs", None) or [])
         report_targets = self._build_report_targets(self.session.intent) if self.session.intent else []
         report_target_norm_map = {
             self._normalize_report_name_key(name): name for name in report_targets if self._normalize_report_name_key(name)
@@ -1975,9 +2301,33 @@ class OptTaskPipeline:
         if not report_modules:
             report_phase_confirmed = True
         module_key_to_stage = {m.module_key: idx for idx, m in enumerate(report_modules)}
+        module_route_tokens_by_key: dict[str, list[str]] = {}
+        module_has_select_steps: dict[str, bool] = {}
+        select_route_prereq_rules: list[dict[str, str]] = []
         field_key_to_stage: dict[str, int] = {}
         file_key_to_stage: dict[str, int] = {}
         token_to_stages: dict[str, set[int]] = {}
+        for module in all_modules:
+            module_key = str(getattr(module, "module_key", "") or "").strip()
+            route_tokens = [str(v).strip() for v in (getattr(module, "route_path", []) or []) if str(v).strip()]
+            if module_key:
+                module_route_tokens_by_key[module_key] = route_tokens
+            has_select = False
+            route_tail = route_tokens[-1] if route_tokens else ""
+            for step in (getattr(module, "interaction_steps", []) or []):
+                op = str(getattr(step, "op", "") or "").strip()
+                target = str(getattr(step, "target", "") or "").strip()
+                if op in {"select", "select_path", "set_date_range"} and target and route_tail:
+                    has_select = True
+                    select_route_prereq_rules.append(
+                        {
+                            "module_key": module_key,
+                            "target": target,
+                            "route_tail": route_tail,
+                        }
+                    )
+            if module_key:
+                module_has_select_steps[module_key] = has_select
 
         def _norm_token(value: str | None) -> str:
             text = str(value or "").strip().lower()
@@ -2091,6 +2441,107 @@ class OptTaskPipeline:
             for value in values:
                 stages |= _resolve_token_stages(value)
             return max(stages) if stages else -1
+
+        def _remember_success_click_target(target: str | None) -> None:
+            text = str(target or "").strip()
+            if not text:
+                return
+            recent_success_click_targets.append(text)
+            deduped = list(dict.fromkeys([t for t in recent_success_click_targets if str(t).strip()]))
+            recent_success_click_targets[:] = deduped[-12:]
+
+        def _pick_route_tail_for_select_target(select_target: str | None) -> str | None:
+            target = str(select_target or "").strip()
+
+            def _next_missing_route_token(route_tokens: list[str]) -> tuple[str | None, int]:
+                if not route_tokens:
+                    return None, 0
+                idx = 0
+                for clicked in recent_success_click_targets:
+                    if idx >= len(route_tokens):
+                        break
+                    if _same_target(clicked, route_tokens[idx]):
+                        idx += 1
+                if idx >= len(route_tokens):
+                    return None, idx
+                return route_tokens[idx], idx
+
+            scored_candidates: list[tuple[int, str]] = []
+            explicit_match_seen = False
+
+            # 1) Prefer explicit select-target matched modules.
+            if target:
+                matched_module_keys: set[str] = set()
+                for rule in select_route_prereq_rules:
+                    if _same_target(target, rule.get("target")):
+                        mk = str(rule.get("module_key") or "").strip()
+                        if mk:
+                            matched_module_keys.add(mk)
+                if matched_module_keys:
+                    explicit_match_seen = True
+                    any_matched_route_complete = False
+                for mk in matched_module_keys:
+                    route_tokens = module_route_tokens_by_key.get(mk, [])
+                    next_token, progress = _next_missing_route_token(route_tokens)
+                    if next_token is None and progress >= len(route_tokens):
+                        any_matched_route_complete = True
+                        continue
+                    if next_token:
+                        scored_candidates.append((100 + progress, next_token))
+                # Critical: when target maps to multiple modules (e.g. "日期类型"),
+                # if any matched module route is already complete, do not force-jump
+                # to another matched module's tail.
+                if any_matched_route_complete:
+                    return None
+
+            # 2) Fallback by route progress (handles wrong target text like "对比周期").
+            if not scored_candidates and not explicit_match_seen:
+                for mk, route_tokens in module_route_tokens_by_key.items():
+                    if not module_has_select_steps.get(mk, False):
+                        continue
+                    next_token, progress = _next_missing_route_token(route_tokens)
+                    if not next_token:
+                        continue
+                    # Require at least one matched prefix to avoid unrelated jumps.
+                    if progress <= 0:
+                        continue
+                    scored_candidates.append((progress, next_token))
+
+            if not scored_candidates:
+                return None
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+            return scored_candidates[0][1]
+
+        def _pick_recent_route_tail_for_failed_select(select_target: str | None) -> str | None:
+            target = str(select_target or "").strip()
+            matched_tails: list[str] = []
+            if target:
+                for rule in select_route_prereq_rules:
+                    if _same_target(target, rule.get("target")):
+                        rt = str(rule.get("route_tail") or "").strip()
+                        if rt:
+                            matched_tails.append(rt)
+
+            # Prefer the most recently successful matched tail.
+            if matched_tails:
+                for clicked in reversed(recent_success_click_targets):
+                    for tail in matched_tails:
+                        if _same_target(clicked, tail):
+                            return tail
+                return matched_tails[0]
+
+            # Fallback: most recent clicked token that is any module route tail with select steps.
+            all_tails: list[str] = []
+            for mk, route_tokens in module_route_tokens_by_key.items():
+                if not module_has_select_steps.get(mk, False):
+                    continue
+                if route_tokens:
+                    all_tails.append(route_tokens[-1])
+            for clicked in reversed(recent_success_click_targets):
+                for tail in all_tails:
+                    if _same_target(clicked, tail):
+                        return tail
+            return None
 
         def _current_stage_key() -> int:
             return module_stage
@@ -2286,8 +2737,23 @@ class OptTaskPipeline:
                 if not actions:
                     return
 
+                # Global-only bootstrap escape hatch:
+                # when page is blank/error, do not enforce report-phase action filtering,
+                # otherwise model cannot perform initial navigate/open and gets stuck in wait loops.
+                if not report_modules:
+                    cur_url = str(getattr(browser_state_summary, "url", "") or "").strip().lower()
+                    is_blank_or_error = (
+                        (not cur_url)
+                        or cur_url == "about:blank"
+                        or cur_url.startswith("chrome-error://")
+                        or cur_url.startswith("edge-error://")
+                    )
+                    if is_blank_or_error:
+                        return
+
                 filtered = []
                 blocked = []
+                forced_route_click_target: str | None = None
                 for action in actions:
                     name, params = _extract_action_name_and_params(action)
                     if not name:
@@ -2307,6 +2773,18 @@ class OptTaskPipeline:
                             blocked.append(
                                 f"{name}:wrong_target:{current_target or '<empty>'}:pending={pending_click_target}"
                             )
+                            continue
+
+                    # Route-path prerequisite guard for selects:
+                    # if select target belongs to a module whose route tail is not yet reached,
+                    # inject one click on that route tail before running select.
+                    if name == "select_in_content":
+                        select_target = str((params or {}).get("target_text") or "").strip()
+                        route_tail = _pick_route_tail_for_select_target(select_target)
+                        if route_tail and not any(_same_target(route_tail, t) for t in recent_success_click_targets):
+                            blocked.append(f"{name}:route_tail_not_reached:{route_tail}")
+                            if forced_route_click_target is None:
+                                forced_route_click_target = route_tail
                             continue
 
                     if name == "evaluate":
@@ -2401,6 +2879,45 @@ class OptTaskPipeline:
                         f"  pre_guard: blocked raw actions in report phase at step {step_no}: {', '.join(blocked)}"
                     )
 
+                if forced_route_click_target:
+                    try:
+                        forced_route_selectors = [
+                            "main [role='tab']",
+                            "main .ant-tabs-tab",
+                            "main [role='menuitem']",
+                            "main .ant-menu-item",
+                            "main a",
+                            "main button",
+                            ".ant-layout-content [role='tab']",
+                            ".ant-layout-content .ant-tabs-tab",
+                            ".ant-layout-content [role='menuitem']",
+                            ".ant-layout-content .ant-menu-item",
+                            ".ant-layout-content a",
+                            ".ant-layout-content button",
+                            "span",
+                        ]
+                        output_payload = model_output.model_dump(mode="json", exclude_none=False)
+                        output_payload["action"] = [
+                            {
+                                "click_in_content": {
+                                    "profile_name": str(getattr(profile, "profile_name", "generic") or "generic"),
+                                    "target_text": forced_route_click_target,
+                                    "selectors": forced_route_selectors,
+                                    "wait_seconds": 2.0,
+                                }
+                            }
+                        ]
+                        rebuilt = type(model_output).model_validate(output_payload)
+                        rebuilt_actions = list(getattr(rebuilt, "action", []) or [])
+                        if rebuilt_actions:
+                            model_output.action = rebuilt_actions
+                            log_messages.append(
+                                f"  pre_guard: enforce_route_tail_before_select -> click_in_content('{forced_route_click_target}')"
+                            )
+                            return
+                    except Exception as exc:
+                        log_messages.append(f"  pre_guard: enforce_route_tail_injection_failed: {exc}")
+
                 if filtered:
                     model_output.action = filtered
                     return
@@ -2409,7 +2926,8 @@ class OptTaskPipeline:
                 safe_action = None
                 try:
                     output_payload = model_output.model_dump(mode="json", exclude_none=False)
-                    output_payload["action"] = [{"wait": {"seconds": 0.8}}]
+                    # Use integer seconds for wait action model compatibility.
+                    output_payload["action"] = [{"wait": {"seconds": 1}}]
                     rebuilt = type(model_output).model_validate(output_payload)
                     rebuilt_actions = list(getattr(rebuilt, "action", []) or [])
                     if rebuilt_actions:
@@ -2422,20 +2940,134 @@ class OptTaskPipeline:
                         f"  pre_guard: replaced blocked actions with wait at step {step_no} (report phase)"
                     )
                 else:
-                    # Last-resort fallback: keep one original action to avoid empty-action stop loops
-                    # when we cannot construct a typed wait action from the current model class.
-                    model_output.action = actions[:1]
-                    log_messages.append(
-                        f"  pre_guard: wait-injection failed at step {step_no}; fallback to original action to avoid empty-action stop"
-                    )
+                    # Global-only runs: keep one fallback action, but avoid unsafe raw click
+                    # when pending click/date guards are active.
+                    if not report_modules and actions:
+                        first_name, _first_params = _extract_action_name_and_params(actions[0])
+                        has_pending_block = any("pending_click_target:" in str(item) for item in blocked)
+                        has_date_block = any("date_range_native_only" in str(item) for item in blocked)
+                        if (has_pending_block or has_date_block) and first_name == "click":
+                            model_output.action = []
+                            log_messages.append(
+                                f"  pre_guard: wait-injection failed at step {step_no}; blocked raw click fallback due to pending/date guard (global-only)"
+                            )
+                        else:
+                            model_output.action = actions[:1]
+                            log_messages.append(
+                                f"  pre_guard: wait-injection failed at step {step_no}; fallback to original action (global-only)"
+                            )
+                    else:
+                        # Report-phase: keep strict block to prevent drift.
+                        model_output.action = []
+                        log_messages.append(
+                            f"  pre_guard: wait-injection failed at step {step_no}; blocked original unsafe action"
+                        )
             except Exception as exc:  # noqa: BLE001
                 log_messages.append(f"  pre_guard_error: {exc}")
+
+        async def _pre_action_pending_click_retry_guard(browser_state_summary, model_output, step_no: int):
+            nonlocal pending_click_target, pending_click_retry_count
+            try:
+                actions = list(getattr(model_output, "action", []) or [])
+                route_click_selectors = [
+                    "main [role='tab']",
+                    "main .ant-tabs-tab",
+                    "main [role='menuitem']",
+                    "main .ant-menu-item",
+                    "main a",
+                    "main button",
+                    ".ant-layout-content [role='tab']",
+                    ".ant-layout-content .ant-tabs-tab",
+                    ".ant-layout-content [role='menuitem']",
+                    ".ant-layout-content .ant-menu-item",
+                    ".ant-layout-content a",
+                    ".ant-layout-content button",
+                    "span",
+                ]
+
+                # Always-on minimal route-tail guard:
+                # pre_guard is usually disabled, so enforce route completion for select steps here.
+                enable_route_tail_guard = str(os.getenv("YUNTU_ENABLE_ROUTE_TAIL_GUARD", "1")).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if enable_route_tail_guard and not pending_click_target and actions:
+                    first_name, first_params = _extract_action_name_and_params(actions[0])
+                    if first_name == "select_in_content":
+                        select_target = str((first_params or {}).get("target_text") or "").strip()
+                        route_tail = _pick_route_tail_for_select_target(select_target)
+                        if route_tail and not any(_same_target(route_tail, t) for t in recent_success_click_targets):
+                            try:
+                                output_payload = model_output.model_dump(mode="json", exclude_none=False)
+                                output_payload["action"] = [
+                                    {
+                                        "click_in_content": {
+                                            "profile_name": str(getattr(profile, "profile_name", "generic") or "generic"),
+                                            "target_text": route_tail,
+                                            "selectors": route_click_selectors,
+                                            "wait_seconds": 2.0,
+                                        }
+                                    }
+                                ]
+                                rebuilt = type(model_output).model_validate(output_payload)
+                                rebuilt_actions = list(getattr(rebuilt, "action", []) or [])
+                                if rebuilt_actions:
+                                    model_output.action = rebuilt_actions
+                                    pending_click_target = route_tail
+                                    pending_click_retry_count = 0
+                                    log_messages.append(
+                                        f"  click_retry_guard: enforce_route_tail_before_select -> click_in_content('{route_tail}')"
+                                    )
+                                    return
+                            except Exception as exc:
+                                log_messages.append(f"  click_retry_guard: enforce_route_tail_injection_failed: {exc}")
+
+                if not pending_click_target:
+                    return
+
+                # Do not hard-lock forever on one missing node.
+                if pending_click_retry_count >= 2:
+                    log_messages.append(
+                        f"  click_retry_guard: retry limit reached for '{pending_click_target}', continue next steps"
+                    )
+                    pending_click_target = None
+                    pending_click_retry_count = 0
+                    return
+
+                if actions:
+                    name, params = _extract_action_name_and_params(actions[0])
+                    current_target = str((params or {}).get("target_text") or "").strip()
+                    if name == "click_in_content" and _same_target(current_target, pending_click_target):
+                        return
+
+                output_payload = model_output.model_dump(mode="json", exclude_none=False)
+                output_payload["action"] = [
+                    {
+                        "click_in_content": {
+                            "profile_name": str(getattr(profile, "profile_name", "generic") or "generic"),
+                            "target_text": pending_click_target,
+                            "selectors": route_click_selectors,
+                            "wait_seconds": 2.0,
+                        }
+                    }
+                ]
+                rebuilt = type(model_output).model_validate(output_payload)
+                rebuilt_actions = list(getattr(rebuilt, "action", []) or [])
+                if rebuilt_actions:
+                    model_output.action = rebuilt_actions
+                    log_messages.append(
+                        f"  click_retry_guard: enforce retry click_in_content('{pending_click_target}')"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log_messages.append(f"  click_retry_guard_error: {exc}")
 
         async def on_step_start(agent_instance):
             log_messages.append(f"{phase_name} step {agent_instance.state.n_steps} started")
 
         async def on_step_end(agent_instance):
-            nonlocal report_phase_confirmed, empty_action_streak, pending_click_target, current_report_name
+            nonlocal report_phase_confirmed, empty_action_streak, pending_click_target, pending_click_retry_count, current_report_name
             step_num = agent_instance.state.n_steps
             output = agent_instance.state.last_model_output
 
@@ -2518,6 +3150,14 @@ class OptTaskPipeline:
                     if result.extracted_content:
                         runtime_extracted_contents.append(result.extracted_content)
                         payload = result.extracted_content
+                        # Track successful native click labels (non-JSON text) for route-progress guards.
+                        try:
+                            if isinstance(payload, str) and payload.startswith("Clicked "):
+                                m = re.search(r"\"([^\"]+)\"", payload)
+                                if m:
+                                    _remember_success_click_target(str(m.group(1) or "").strip())
+                        except Exception:
+                            pass
                         payload_dict = self._parse_json_payload(payload)
                         if payload_dict:
                             _update_stage_from_payload(payload_dict)
@@ -2536,14 +3176,45 @@ class OptTaskPipeline:
                             if payload_type == "click_in_content_result":
                                 target_text = str(payload_dict.get("target_text") or "").strip()
                                 clicked_ok = bool(payload_dict.get("clicked"))
+                                click_error = str(payload_dict.get("error") or "").strip()
+                                log_messages.append(
+                                    f"  result: click target='{target_text}' clicked={clicked_ok} error='{click_error or '-'}'"
+                                )
                                 if target_text and not clicked_ok:
-                                    pending_click_target = target_text
+                                    if _same_target(target_text, pending_click_target):
+                                        pending_click_retry_count += 1
+                                    else:
+                                        pending_click_target = target_text
+                                        pending_click_retry_count = 0
                                     log_messages.append(
-                                        f"  guard: pending_click_target set to '{target_text}' (click failed)"
+                                        f"  guard: pending_click_target set to '{target_text}' (click failed, retry_count={pending_click_retry_count})"
                                     )
                                 elif target_text and clicked_ok and _same_target(target_text, pending_click_target):
                                     pending_click_target = None
+                                    pending_click_retry_count = 0
                                     log_messages.append("  guard: pending_click_target cleared (click confirmed)")
+                                if target_text and clicked_ok:
+                                    _remember_success_click_target(target_text)
+                            elif payload_type == "select_in_content_result":
+                                target_text = str(payload_dict.get("target_text") or "").strip()
+                                status = str(payload_dict.get("status") or "").strip().lower()
+                                select_error = str(payload_dict.get("error") or "").strip()
+                                if (
+                                    target_text
+                                    and status in {"failed", "blocked_repeated_failure"}
+                                    and select_error in {"target_control_not_found", "target_label_mismatch"}
+                                ):
+                                    retry_tail = _pick_recent_route_tail_for_failed_select(target_text)
+                                    if retry_tail:
+                                        pending_click_target = retry_tail
+                                        pending_click_retry_count = 0
+                                        # Invalidate optimistic route-progress memory for this tail.
+                                        recent_success_click_targets[:] = [
+                                            t for t in recent_success_click_targets if not _same_target(t, retry_tail)
+                                        ]
+                                        log_messages.append(
+                                            f"  guard: select failed ({select_error}), force re-position route tail '{retry_tail}'"
+                                        )
                         if (
                             "field_extraction_result" in payload
                             or "file_download_result" in payload
@@ -2588,9 +3259,31 @@ class OptTaskPipeline:
             log_messages.append(f"{phase_name} step {step_num - 1} finished")
 
         async def run_agent():
+            # Disable pre-action guard by default to avoid over-filtering first-step actions.
+            # Re-enable only when explicitly needed via env.
+            enable_pre_guard = str(os.getenv("YUNTU_ENABLE_PRE_GUARD", "0")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if not enable_pre_guard:
+                log_messages.append("  pre_guard: disabled")
+                old_callback = getattr(agent, "register_new_step_callback", None)
+                agent.register_new_step_callback = _pre_action_pending_click_retry_guard
+                try:
+                    return await agent.run(on_step_start=on_step_start, on_step_end=on_step_end)
+                finally:
+                    agent.register_new_step_callback = old_callback
+
             old_callback = getattr(agent, "register_new_step_callback", None)
-            agent.register_new_step_callback = _pre_action_guard
+            async def _combined_pre_step_guard(browser_state_summary, model_output, step_no: int):
+                await _pre_action_pending_click_retry_guard(browser_state_summary, model_output, step_no)
+                await _pre_action_guard(browser_state_summary, model_output, step_no)
+
+            agent.register_new_step_callback = _combined_pre_step_guard
             try:
+                log_messages.append("  pre_guard: enabled")
                 return await agent.run(on_step_start=on_step_start, on_step_end=on_step_end)
             finally:
                 agent.register_new_step_callback = old_callback
@@ -2893,6 +3586,8 @@ class OptTaskPipeline:
         hint_text = "\n".join([str(final_result_text or ""), str(log_text or "")]).strip()
 
         extracted_contents = result.extracted_content() if hasattr(result, "extracted_content") else []
+        report_period_map = self._extract_report_period_map(extracted_contents)
+        self._sync_period_map_to_intent(self.session.intent, report_period_map)
         default_period_label = self._infer_default_period_label_from_intent(self.session.intent)
         recovery_output = self._build_partial_structured_output(
             profile=profile,
@@ -2955,6 +3650,8 @@ class OptTaskPipeline:
                 structured_output=structured_output,
                 profile=profile,
                 task_intent=self.session.intent,
+                report_period_map=report_period_map,
+                output_dir=output_dir,
             )
             business_summary = self._merge_business_summary_with_progress(output_dir, business_summary)
             self._update_report_progress_map(output_dir, business_summary)

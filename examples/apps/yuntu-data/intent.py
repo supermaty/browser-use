@@ -259,6 +259,14 @@ class YuntuTask(BaseModel):
         None,
         description="竞价（竞价投放）消耗金额（元）；单报告模式时必填；品牌分类模式时由各分类内 consumption_amount_bid 提供",
     )
+    current_report_period: str | None = Field(
+        None,
+        description="Runtime field: current report period in format YYYY-MM-DD ~ YYYY-MM-DD",
+    )
+    report_period_map: dict[str, str] | None = Field(
+        None,
+        description="Runtime field: normalized report_name -> period mapping",
+    )
 
 async def extract_intent(
     task_description: str,
@@ -381,4 +389,6 @@ async def extract_intent(
             brand_name=None,
             consumption_amount_star=None,
             consumption_amount_bid=None,
+            current_report_period=None,
+            report_period_map=None,
         )

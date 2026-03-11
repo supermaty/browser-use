@@ -212,7 +212,13 @@ class DomService:
 		"""Recursively collect all frames and merge their accessibility trees into a single array."""
 
 		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
-		frame_tree = await cdp_session.cdp_client.send.Page.getFrameTree(session_id=cdp_session.session_id)
+		try:
+			frame_tree = await cdp_session.cdp_client.send.Page.getFrameTree(session_id=cdp_session.session_id)
+		except Exception as e:
+			# During SPA transitions some frame ids become stale for a short window.
+			# AX tree is optional for DOM serialization, so degrade gracefully.
+			self.logger.debug(f'AX frame tree fetch failed (degraded to empty AX tree): {e}')
+			return {'nodes': []}
 
 		def collect_all_frame_ids(frame_tree_node) -> list[str]:
 			"""Recursively collect all frame IDs from the frame tree."""
@@ -235,13 +241,16 @@ class DomService:
 			)
 			ax_tree_requests.append(ax_tree_request)
 
-		# Wait for all requests to complete
-		ax_trees = await asyncio.gather(*ax_tree_requests)
+		# Wait for all requests to complete; stale frame failures are expected in dynamic pages.
+		ax_trees = await asyncio.gather(*ax_tree_requests, return_exceptions=True)
 
 		# Merge all AX nodes into a single array
 		merged_nodes: list[AXNode] = []
 		for ax_tree in ax_trees:
-			merged_nodes.extend(ax_tree['nodes'])
+			if isinstance(ax_tree, Exception):
+				self.logger.debug(f'AX tree request failed for one frame (ignored): {ax_tree}')
+				continue
+			merged_nodes.extend(ax_tree.get('nodes', []))
 
 		return {'nodes': merged_nodes}
 
@@ -320,10 +329,20 @@ class DomService:
 
 		# Create initial tasks
 		tasks = {
-			'snapshot': create_task_with_error_handling(create_snapshot_request(), name='get_snapshot'),
-			'dom_tree': create_task_with_error_handling(create_dom_tree_request(), name='get_dom_tree'),
-			'ax_tree': create_task_with_error_handling(self._get_ax_tree_for_all_frames(target_id), name='get_ax_tree'),
-			'device_pixel_ratio': create_task_with_error_handling(self._get_viewport_ratio(target_id), name='get_viewport_ratio'),
+			# These tasks are explicitly awaited/inspected below; suppress callback re-raise to avoid
+			# noisy event-loop exceptions for recoverable transient failures.
+			'snapshot': create_task_with_error_handling(
+				create_snapshot_request(), name='get_snapshot', suppress_exceptions=True
+			),
+			'dom_tree': create_task_with_error_handling(
+				create_dom_tree_request(), name='get_dom_tree', suppress_exceptions=True
+			),
+			'ax_tree': create_task_with_error_handling(
+				self._get_ax_tree_for_all_frames(target_id), name='get_ax_tree', suppress_exceptions=True
+			),
+			'device_pixel_ratio': create_task_with_error_handling(
+				self._get_viewport_ratio(target_id), name='get_viewport_ratio', suppress_exceptions=True
+			),
 		}
 
 		# Wait for all tasks with timeout
@@ -336,13 +355,17 @@ class DomService:
 
 			# Retry mapping for pending tasks
 			retry_map = {
-				tasks['snapshot']: lambda: create_task_with_error_handling(create_snapshot_request(), name='get_snapshot_retry'),
-				tasks['dom_tree']: lambda: create_task_with_error_handling(create_dom_tree_request(), name='get_dom_tree_retry'),
+				tasks['snapshot']: lambda: create_task_with_error_handling(
+					create_snapshot_request(), name='get_snapshot_retry', suppress_exceptions=True
+				),
+				tasks['dom_tree']: lambda: create_task_with_error_handling(
+					create_dom_tree_request(), name='get_dom_tree_retry', suppress_exceptions=True
+				),
 				tasks['ax_tree']: lambda: create_task_with_error_handling(
-					self._get_ax_tree_for_all_frames(target_id), name='get_ax_tree_retry'
+					self._get_ax_tree_for_all_frames(target_id), name='get_ax_tree_retry', suppress_exceptions=True
 				),
 				tasks['device_pixel_ratio']: lambda: create_task_with_error_handling(
-					self._get_viewport_ratio(target_id), name='get_viewport_ratio_retry'
+					self._get_viewport_ratio(target_id), name='get_viewport_ratio_retry', suppress_exceptions=True
 				),
 			}
 
@@ -372,14 +395,15 @@ class DomService:
 				self.logger.warning(f'CDP request {key} timed out')
 				failed.append(key)
 
-		# If any required tasks failed, raise an exception
-		if failed:
-			raise TimeoutError(f'CDP requests failed or timed out: {", ".join(failed)}')
+		# AX tree and viewport ratio are optional for robust DOM capture.
+		required_failed = [key for key in failed if key in {'snapshot', 'dom_tree'}]
+		if required_failed:
+			raise TimeoutError(f'CDP requests failed or timed out: {", ".join(required_failed)}')
 
 		snapshot = results['snapshot']
 		dom_tree = results['dom_tree']
-		ax_tree = results['ax_tree']
-		device_pixel_ratio = results['device_pixel_ratio']
+		ax_tree = results.get('ax_tree', {'nodes': []})
+		device_pixel_ratio = results.get('device_pixel_ratio', 1.0)
 		end_cdp_calls = time.time()
 		cdp_calls_ms = (end_cdp_calls - start_cdp_calls) * 1000
 

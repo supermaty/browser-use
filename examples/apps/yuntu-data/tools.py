@@ -31,6 +31,21 @@ from specs import (
 logger = logging.getLogger(__name__)
 
 
+def _cap_max_wait_seconds(value: int | None, default: int = 20, upper: int = 20) -> int:
+    """Normalize user/model-provided max_wait_seconds into [1, upper]."""
+    try:
+        if value is None:
+            return int(default)
+        normalized = int(value)
+    except Exception:
+        normalized = int(default)
+    if normalized < 1:
+        normalized = 1
+    if normalized > upper:
+        normalized = upper
+    return normalized
+
+
 class ExtractFieldsBySpecParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -3106,7 +3121,7 @@ async def _download_files_by_specs(
             )
             continue
 
-        timeout = max_wait_seconds or spec.timeout_seconds or 20
+        timeout = _cap_max_wait_seconds(max_wait_seconds or spec.timeout_seconds or 20)
         try:
             await asyncio.sleep(0.35)
             await _confirm_export_dialog_if_needed(browser_session)
@@ -7882,6 +7897,175 @@ async def _is_option_overlay_visible(browser_session: BrowserSession) -> dict:
     return {"visible": bool(parsed.get("visible")), "count": int(parsed.get("count", 0) or 0)}
 
 
+def _normalize_date_text(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("至", "~").replace("—", "~").replace("-", "~")
+    text = text.replace("/", ".")
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def _parse_date_range_value(value: str | None) -> tuple[str, str] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(
+        r"(\d{4}[./-]\d{1,2}[./-]\d{1,2})\s*(?:至|~|—|-|to)\s*(\d{4}[./-]\d{1,2}[./-]\d{1,2})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).strip()
+
+
+async def _verify_date_filter_applied(browser_session: BrowserSession, target: str | None, value: str) -> dict:
+    page = await browser_session.must_get_current_page()
+    expected = _normalize_date_text(value)
+    if not expected:
+        return {"applied": False, "reason": "empty_expected", "evidence": None}
+    js = r"""
+(input) => {
+  const target = String(input?.target || "").trim();
+  const expected = String(input?.expected || "").trim();
+  const out = { applied: false, reason: null, evidence: null };
+  if (!expected) {
+    out.reason = "empty_expected";
+    return out;
+  }
+  const clean = (v) => String(v ?? "").replace(/\s+/g, "").trim();
+  const norm = (v) => clean(v).replace(/至/g, "~").replace(/[—-]/g, "~").replace(/\//g, ".");
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+  };
+  const textOf = (el) =>
+    clean(
+      el?.value ||
+      el?.getAttribute?.("value") ||
+      el?.getAttribute?.("aria-label") ||
+      el?.innerText ||
+      el?.textContent ||
+      ""
+    );
+
+  const targetNorm = norm(target);
+  const expectedNorm = norm(expected);
+  const parseRange = (txt) => {
+    const t = norm(txt);
+    if (!t || !t.includes("~")) return null;
+    const parts = t.split("~");
+    if (parts.length < 2) return null;
+    const start = parts[0] || "";
+    const end = parts[1] || "";
+    if (!start || !end) return null;
+    return { start, end };
+  };
+  const expectedRange = parseRange(expectedNorm);
+  const matchValue = (txt) => {
+    const t = norm(txt);
+    if (!t) return false;
+    if (t === expectedNorm || t.includes(expectedNorm) || expectedNorm.includes(t)) return true;
+    if (expectedRange) {
+      const got = parseRange(t);
+      if (got && got.start && got.end) {
+        return (
+          (got.start === expectedRange.start || got.start.includes(expectedRange.start) || expectedRange.start.includes(got.start)) &&
+          (got.end === expectedRange.end || got.end.includes(expectedRange.end) || expectedRange.end.includes(got.end))
+        );
+      }
+      return t.includes(expectedRange.start) && t.includes(expectedRange.end);
+    }
+    return false;
+  };
+
+  const candidateSelectors = [
+    ".ant-picker-input input",
+    ".ant-picker input",
+    "input[placeholder*='开始']",
+    "input[placeholder*='结束']",
+    "input[placeholder*='日期']",
+    "input[placeholder*='时间']",
+    "input[placeholder*='range']",
+    "input",
+    ".ant-select-selector",
+    "[role='combobox']",
+    ".ant-form-item",
+    "label",
+    "span",
+    "div"
+  ];
+
+  const seen = new Set();
+  const nodes = [];
+  for (const sel of candidateSelectors) {
+    const list = Array.from(document.querySelectorAll(sel));
+    for (const node of list) {
+      if (!node || seen.has(node)) continue;
+      seen.add(node);
+      if (!isVisible(node)) continue;
+      const text = textOf(node);
+      if (!text) continue;
+      nodes.push({ node, text });
+    }
+  }
+
+  const targetFiltered = [];
+  for (const item of nodes) {
+    const node = item.node;
+    const txt = item.text;
+    if (!targetNorm) {
+      targetFiltered.push(item);
+      continue;
+    }
+    const nearText = clean(
+      node?.closest?.(".ant-form-item,.ant-row,.ant-col,section,article,div")?.innerText ||
+      node?.parentElement?.innerText ||
+      ""
+    );
+    const nearNorm = norm(nearText);
+    if (nearNorm.includes(targetNorm) || targetNorm.includes(nearNorm)) {
+      targetFiltered.push(item);
+      continue;
+    }
+    const ownNorm = norm(txt);
+    if (ownNorm.includes(targetNorm) || targetNorm.includes(ownNorm)) {
+      targetFiltered.push(item);
+      continue;
+    }
+  }
+
+  const pool = targetFiltered.length ? targetFiltered : nodes;
+  for (const item of pool) {
+    const txt = item.text;
+    if (matchValue(txt)) {
+      out.applied = true;
+      out.reason = targetFiltered.length ? "target_value_match" : "global_value_match";
+      out.evidence = txt;
+      return out;
+    }
+  }
+
+  if (!pool.length) {
+    out.reason = "no_visible_candidates";
+  } else {
+    out.reason = "value_mismatch";
+    out.evidence = pool.slice(0, 3).map((x) => x.text).join(" | ");
+  }
+  return out;
+}
+"""
+    raw = await page.evaluate(js, {"target": target or "", "expected": expected})
+    parsed = _json_loads_if_possible(raw)
+    if not isinstance(parsed, dict):
+        return {"applied": False, "reason": f"invalid_js_result:{raw}", "evidence": None}
+    return parsed
+
+
 async def _set_date_filter(browser_session: BrowserSession, target: str | None, value: str) -> dict:
     result = {
         "status": "failed",
@@ -7894,46 +8078,95 @@ async def _set_date_filter(browser_session: BrowserSession, target: str | None, 
         return result
 
     normalized = value.strip()
+    open_selectors = ["label", ".ant-picker", ".ant-select-selector", "[role='combobox']", ".ant-form-item-label"]
+
     if target:
         click_target = await _click_text_step(
             browser_session,
             target,
-            ["label", ".ant-picker", ".ant-select-selector", "[role='combobox']", ".ant-form-item-label"],
+            open_selectors,
             allow_reverse_contains=False,
             avoid_global_nav=False,
             require_clickable=True,
             max_text_len=48,
         )
         result["details"].append({"phase": "open_target", "ok": bool(click_target.get("clicked")), "raw": click_target})
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.35)
 
-    if "~" not in normalized and "至" not in normalized and "-" not in normalized.replace(" ", ""):
-        selected = await _select_option_by_text(browser_session, normalized)
-        result["details"].append({"phase": "select_type", "ok": bool(selected.get("selected")), "raw": selected})
-        if selected.get("selected"):
+    date_range = _parse_date_range_value(normalized)
+    if date_range is None:
+        selected = {"selected": False, "error": "not_attempted"}
+        if target:
+            targeted = await _set_select_value_by_target(browser_session, target, normalized)
+            result["details"].append({"phase": "set_type_targeted", "ok": bool(targeted.get("selected")), "raw": targeted})
+            if targeted.get("selected"):
+                selected = targeted
+        if not selected.get("selected"):
+            selected = await _select_option_by_text(
+                browser_session,
+                normalized,
+                target_label=target,
+                avoid_global_nav=True,
+            )
+            result["details"].append({"phase": "select_type_targeted", "ok": bool(selected.get("selected")), "raw": selected})
+        if not selected.get("selected"):
+            selected = await _select_option_by_text(browser_session, normalized)
+            result["details"].append({"phase": "select_type_global", "ok": bool(selected.get("selected")), "raw": selected})
+
+        verify_type = await _verify_selection_applied(browser_session, target, normalized)
+        result["details"].append({"phase": "verify_type", "ok": bool(verify_type.get("applied")), "raw": verify_type})
+        if (not verify_type.get("applied")) and target:
+            reopen = await _click_text_step(
+                browser_session,
+                target,
+                open_selectors,
+                allow_reverse_contains=False,
+                avoid_global_nav=False,
+                require_clickable=True,
+                max_text_len=48,
+            )
+            result["details"].append({"phase": "reopen_target_for_type", "ok": bool(reopen.get("clicked")), "raw": reopen})
+            await asyncio.sleep(0.35)
+            retry = await _set_select_value_by_target(browser_session, target, normalized)
+            result["details"].append({"phase": "retry_set_type_targeted", "ok": bool(retry.get("selected")), "raw": retry})
+            verify_type = await _verify_selection_applied(browser_session, target, normalized)
+            result["details"].append({"phase": "retry_verify_type", "ok": bool(verify_type.get("applied")), "raw": verify_type})
+
+        if verify_type.get("applied"):
             result["status"] = "ok"
             result["date_type"] = normalized
         return result
 
-    date_value = normalized.replace("至", "~")
-    if "~" not in date_value:
-        date_value = date_value.replace("—", "-")
-    if "~" in date_value:
-        parts = [part.strip() for part in date_value.split("~", 1)]
-    else:
-        parts = [part.strip() for part in date_value.split("-", 1)]
-    if len(parts) != 2:
-        result["status"] = "failed"
-        result["details"].append({"phase": "parse_range", "ok": False, "raw": {"value": normalized}})
-        return result
-
-    start, end = parts
-    fill_start = await _fill_input_by_target(browser_session, "开始", start)
-    fill_end = await _fill_input_by_target(browser_session, "结束", end)
-    result["details"].append({"phase": "fill_start", "ok": bool(fill_start.get("filled")), "raw": fill_start})
-    result["details"].append({"phase": "fill_end", "ok": bool(fill_end.get("filled")), "raw": fill_end})
+    start, end = date_range
     result["date_range"] = f"{start}~{end}"
-    result["status"] = "ok" if fill_start.get("filled") or fill_end.get("filled") else "failed"
+    verify_range = {"applied": False, "reason": "not_verified", "evidence": None}
+
+    for attempt in range(2):
+        if attempt == 1 and target:
+            reopen = await _click_text_step(
+                browser_session,
+                target,
+                open_selectors,
+                allow_reverse_contains=False,
+                avoid_global_nav=False,
+                require_clickable=True,
+                max_text_len=48,
+            )
+            result["details"].append({"phase": "reopen_target_for_range", "ok": bool(reopen.get("clicked")), "raw": reopen})
+            await asyncio.sleep(0.35)
+
+        fill_start = await _fill_input_by_target(browser_session, "开始", start)
+        fill_end = await _fill_input_by_target(browser_session, "结束", end)
+        result["details"].append({"phase": f"fill_start_{attempt+1}", "ok": bool(fill_start.get("filled")), "raw": fill_start})
+        result["details"].append({"phase": f"fill_end_{attempt+1}", "ok": bool(fill_end.get("filled")), "raw": fill_end})
+        await asyncio.sleep(0.25)
+        verify_range = await _verify_date_filter_applied(browser_session, target, result["date_range"])
+        result["details"].append({"phase": f"verify_range_{attempt+1}", "ok": bool(verify_range.get("applied")), "raw": verify_range})
+        if verify_range.get("applied"):
+            result["status"] = "ok"
+            return result
+
+    result["status"] = "failed"
     return result
 
 
@@ -9383,9 +9616,27 @@ def create_opt_tools(session: TaskSession) -> Tools:
         pre_guard = await _guard_and_recover_unexpected_page(browser_session)
 
         target_text = (params.target_text or "").strip() or None
-        values = [v.strip() for v in (params.path or []) if str(v).strip()]
-        if not values and (params.value or "").strip():
-            values = _split_select_values((params.value or "").strip())
+        raw_value = (params.value or "").strip()
+        is_date_range_value = False
+        if raw_value:
+            try:
+                is_date_range_value = bool(
+                    re.search(
+                        r"\d{4}[./-]\d{1,2}[./-]\d{1,2}\s*(?:~|至|to|-)\s*\d{4}[./-]\d{1,2}[./-]\d{1,2}",
+                        raw_value,
+                    )
+                )
+            except Exception:
+                is_date_range_value = False
+
+        # For date-range selection, always prioritize value itself and ignore `path`.
+        # `path` is for cascader selections (a/b/c) and can shadow date-range values.
+        if is_date_range_value:
+            values = [raw_value]
+        else:
+            values = [v.strip() for v in (params.path or []) if str(v).strip()]
+            if not values and raw_value:
+                values = _split_select_values(raw_value)
 
         if not values:
             return ActionResult(
@@ -9403,6 +9654,15 @@ def create_opt_tools(session: TaskSession) -> Tools:
                     ensure_ascii=False,
                 )
             )
+
+        select_semantic = f"{target_text or ''} {' / '.join(values)}"
+        is_date_like_select = bool(
+            re.search(
+                r"(日期|时间|date|range|日历|calendar|自定义|按周|按月|实时|近\s*\d+\s*天)",
+                select_semantic,
+                flags=re.IGNORECASE,
+            )
+        )
 
         page = await browser_session.must_get_current_page()
         page_url = str(getattr(page, "url", "") or "").split("?", 1)[0]
@@ -9429,6 +9689,65 @@ def create_opt_tools(session: TaskSession) -> Tools:
                         "retry_count": current_select_streak,
                         "target_click": None,
                         "selections": [],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+        # Date-range fast path: run date filter + strict verification first.
+        if is_date_range_value and len(values) == 1:
+            date_result = await _set_date_filter(
+                browser_session=browser_session,
+                target=target_text,
+                value=values[0],
+            )
+            if date_result.get("status") == "ok":
+                select_streak_map[select_sig] = 0
+                post_guard = await _guard_and_recover_unexpected_page(browser_session)
+                _append_runtime_hints([target_text, values[0], date_result.get("date_range")])
+                return ActionResult(
+                    extracted_content=json.dumps(
+                        {
+                            "type": "select_in_content_result",
+                            "profile_name": profile.profile_name,
+                            "requested_profile_name": params.profile_name,
+                            "target_text": target_text,
+                            "values": values,
+                            "status": "ok",
+                            "target_click": None,
+                            "selections": [
+                                {
+                                    "step_no": 1,
+                                    "value": values[0],
+                                    "selected": True,
+                                    "text": date_result.get("date_range") or values[0],
+                                    "error": None,
+                                    "verify": {"applied": True, "reason": "date_range_verified", "evidence": None},
+                                    "date_fallback": date_result,
+                                    "page_guard": post_guard,
+                                }
+                            ],
+                            "page_guard": {"before": pre_guard, "after": post_guard},
+                            "note": "date_range_fast_path",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            select_streak_map[select_sig] = current_select_streak + 1
+            return ActionResult(
+                extracted_content=json.dumps(
+                    {
+                        "type": "select_in_content_result",
+                        "profile_name": profile.profile_name,
+                        "requested_profile_name": params.profile_name,
+                        "target_text": target_text,
+                        "values": values,
+                        "status": "failed",
+                        "error": "date_range_not_applied",
+                        "target_click": None,
+                        "selections": [],
+                        "date_result": date_result,
+                        "page_guard": {"before": pre_guard},
                     },
                     ensure_ascii=False,
                 )
@@ -9833,7 +10152,7 @@ def create_opt_tools(session: TaskSession) -> Tools:
                         "error": None,
                         "overlay_fallback": overlay_click,
                     }
-            if (not selected.get("selected")) and target_text and len(values) == 1:
+            if (not selected.get("selected")) and target_text and len(values) == 1 and (not is_date_like_select):
                 typed_select = await _set_select_value_by_target(
                     browser_session=browser_session,
                     target=target_text,
@@ -10052,6 +10371,7 @@ def create_opt_tools(session: TaskSession) -> Tools:
         params: DownloadFilesBySpecParams,
         browser_session,
     ) -> ActionResult:
+        normalized_max_wait_seconds = _cap_max_wait_seconds(params.max_wait_seconds)
         effective_profile_name = _resolve_effective_profile_name(session, params.profile_name)
         await _ensure_single_tab_guard(browser_session)
         page_guard = await _guard_and_recover_unexpected_page(browser_session)
@@ -10293,7 +10613,7 @@ def create_opt_tools(session: TaskSession) -> Tools:
                 browser_session=browser_session,
                 specs=[spec],
                 download_dir=download_dir,
-                max_wait_seconds=params.max_wait_seconds,
+                max_wait_seconds=normalized_max_wait_seconds,
                 download_context=context,
             )
             outputs.extend(one)
@@ -10661,6 +10981,7 @@ def create_opt_tools(session: TaskSession) -> Tools:
                 ),
             )
 
+        normalized_max_wait_seconds = _cap_max_wait_seconds(params.max_wait_seconds)
         auto_touchpoint = _infer_touchpoint_from_report_name(params.report_name)
         touchpoint = params.touchpoint or auto_touchpoint or module.default_touchpoint
         date_range_note = params.date_range
@@ -10673,7 +10994,7 @@ def create_opt_tools(session: TaskSession) -> Tools:
                 "auto_touchpoint": auto_touchpoint,
                 "date_type": params.date_type,
                 "date_range": params.date_range,
-                "max_wait_seconds": params.max_wait_seconds,
+                "max_wait_seconds": normalized_max_wait_seconds,
             },
             "module": {
                 "module_key": module.module_key,
@@ -10707,7 +11028,12 @@ def create_opt_tools(session: TaskSession) -> Tools:
             executed = await _collect_module_data_once(
                 browser_session=browser_session,
                 module=module,
-                params=params.model_copy(update={"profile_name": effective_profile_name}),
+                params=params.model_copy(
+                    update={
+                        "profile_name": effective_profile_name,
+                        "max_wait_seconds": normalized_max_wait_seconds,
+                    }
+                ),
                 context=context,
                 task_dir=Path(session.task_dir) if session.task_dir else None,
             )
@@ -10756,6 +11082,7 @@ def create_opt_tools(session: TaskSession) -> Tools:
                     "date_type": params.date_type,
                     "date_type_result": date_type_result,
                     "date_range": date_range_note,
+                    "max_wait_seconds": normalized_max_wait_seconds,
                     "route_trace": route_trace,
                     "step_trace": step_trace,
                     "retry_trace": retry_trace,

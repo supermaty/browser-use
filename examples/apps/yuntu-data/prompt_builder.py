@@ -350,7 +350,13 @@ def build_phase_b_prompt(task_intent: YuntuTask, profile: BrandProfileSpec) -> s
 You are a deterministic extractor for Yuntu.
 
 Rules:
-1. Execute module DSL steps with tools first: `click_in_content` / `select_in_content`.
+1. Execute module DSL steps agent-first.
+1.1 For each module pass, execute all plain `route_path` nodes in listed order first with native page actions (native click/scroll), then run interaction steps.
+1.2 If a route node cannot be clicked natively after scroll retry, fallback to `click_in_content` for that node.
+1.3 Never start `[select]` / `[set_date_range]` / `[extract]` / `[download]` if the last `route_path` node for that module is not reached.
+1.4 Route-node success evidence must be action-based (native click/scroll effect or `click_in_content_result.clicked=true`); seeing node text alone is NOT success evidence.
+1.5 For explicit DSL `[click]` interaction steps, use `click_in_content(target_text=<dsl target>)`; do NOT use raw `click index`.
+1.6 If browser warns `Element index ... not available`, do NOT refresh-loop; immediately retry with `click_in_content` for that DSL target.
 2. Use native `extract` for `[extract]`.
 2.1 For `[hover]`, use native `evaluate` then native `extract` for the same hover field list.
    Hover requirements:
@@ -378,6 +384,8 @@ Rules:
 8. `extract_fields_by_spec` is DISABLED in report-phase DSL execution. Never call it.
 9. `hover_in_content` is DISABLED in report-phase DSL execution. Never call it.
 10. Return schema-valid JSON only.
+11. After opening each report detail page, run native `extract` once for `计算时间区间` / `计算周期`.
+12. Save that period in memory as `current_report_period` and reuse it for downstream calculations.
 
 Report targets:
 {_format_targets(targets)}
@@ -472,13 +480,31 @@ Hard rules:
 6.2 `hover_in_content` is DISABLED in report-phase DSL execution. Never call it.
 6.3 `dropdown_options` is DISABLED. Never call it.
 {report_detail_rule}
-   - `[click]/[ensure_visible]` -> `click_in_content`
+   - `[click]/[ensure_visible]` -> for DSL interaction steps use `click_in_content` (target text from DSL); for plain route_path nodes keep native click/scroll first with `click_in_content` fallback.
    - `[select]/[select_path]` -> `select_in_content`
    - `[set_date_range]` -> native page click-select only (no manual text input)
+   - Date rule for `[set_date_range]`:
+     a) use calendar/date-picker click-select only; never type or inject input value by script.
+     b) after selection, verify date box shows BOTH start and end dates (normalized format match is allowed).
+     c) if mismatch, reopen date picker and retry this date step at most once; if still mismatch, mark missing and continue.
+     d) for `[set_date_range]`, `path` must stay empty and date type must be handled by `[select]` step.
    - `[extract]/[extract_fields]` -> native `extract`
    - `[hover]` -> native `evaluate` hover tooltip trigger, then native `extract` for the same field list
    - `[download]` -> `download_files_by_spec`
 8. Execute DSL strictly in order. One step at a time, one action at a time.
+8.0 Do not skip plain `route_path` nodes:
+   - In each module pass, process every plain route node in order before the first interaction step.
+   - For clickable route nodes: native click first; if target not visible, scroll and retry; fallback to `click_in_content`.
+   - For non-clickable route nodes (section/card headings): scroll until visible in main content.
+   - If route tail is uncertain, redo route-tail positioning once before `[select]/[set_date_range]/[extract]/[download]`.
+8.1 Route node completion evidence is mandatory:
+   - A route node is completed only when there is action evidence for that exact node:
+     native click changed active state/content OR `click_in_content_result.clicked=true` OR non-clickable heading became visible after scroll.
+   - Never treat memory text like "reached xxx page" as completion evidence.
+   - Without this evidence, do not run `[select]/[set_date_range]/[extract]/[download]`.
+8.2 Stale-index guard:
+   - Never use raw `click index` for explicit DSL `[click]` steps.
+   - If a raw click fails with index-missing warning, switch to `click_in_content` immediately for the same target; do not repeat refresh attempts.
 9. Single-pass policy: each DSL step runs at most once per pass (per cycle label). If failed, mark missing and continue (no loop retry).
 10. If page drifts to message/notice center, go back once and continue from next DSL step.
 11. Hover rule (generic): find container by field semantics, hover only tooltip/help/question trigger in that container, require visible tooltip, extract from tooltip text only.
@@ -506,18 +532,12 @@ Hard rules:
    - only then call `done` with a SHORT text.
 18. Do not run post-validation/recheck loops after all modules are done.
 19. `done` payload rule: do NOT include large nested JSON/data object in `done`. Keep only short text + success flag.
+20. After opening each report detail page, immediately run native `extract` once for `计算时间区间` / `计算周期`, and keep it in memory as `current_report_period`.
 {report_target_loop_rule}
 
 Execution steps:
 A) {execution_a_title}
-1. Open Yuntu and ensure login state.
-2. Switch brand to `{brand_name}` (alias `{brand_name_en}`) via native page actions.
-3. click `营销决策`
-4. click `结案报告` (or `投后结案`)
-5. click `升级版报告` tab and keep it active
-6. use table-area report search (NOT global top search), input `{first_report}`, just press Enter for search
-7. if results are delayed, wait and retry search in the SAME `升级版报告` tab (do not switch tabs)
-8. open same-row `查看报告` (or `详情`) in current tab
+1. Open 'https://yuntu.oceanengine.com/yuntu_brand/ecom/evaluation_brand/history/distribution?aadvid=1703060939338759'
 
 
 B) Data extraction/download (Agent executes DSL + tools collect output)
@@ -525,6 +545,7 @@ B) Data extraction/download (Agent executes DSL + tools collect output)
    - Iterate `report_targets` in listed order.
    - For each report target:
      a) open exact target report in current tab;
+     a.1) immediately run native `extract` to capture `计算时间区间` / `计算周期`, then set/update `current_report_period`;
      b) run ALL `Report modules` in order exactly once for this target;
      c) if report modules finished, return to report list and continue next target.
 10. After all report targets are done (or if no report modules), run ALL `Global modules` once in order.

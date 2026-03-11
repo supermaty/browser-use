@@ -160,55 +160,70 @@ COMMON_DOWNLOAD_SELECTORS = [
 # Keep only route_dsl (and optional module-level metadata).
 # Field/file specs are auto-derived from [extract]/[hover]/[download] in route_dsl.
 DSL_MODULE_OVERRIDES: dict[str, dict[str, Any]] = {
-    "overview_post_report": {
-        "label": "项目整体Overview",
-        "required": True,
-        "requires_report": True,
-        "route_dsl": (
-            "活动总览 > [extract]互动率 > "
-            "流量分析 > [extract]消耗金额,曝光次数,曝光人数,互动量,完播率,完播数 > "
-            "转化分析 > [extract]转化金额,转化人数,ROI"
-        ),
-    },
-    "asset_5a_flow": {
-        "label": "5A人群资产流转",
-        "required": True,
-        "requires_report": True,
-        "route_dsl": (
-            "人群分析 > 5A关系资产分析 > 5A人群资产 > "
-            "[select]触点=全部/全部 > "
-            "[extract]拉新人群规模,拉新比例,A1流转人群,A1流转率,A2流转人群,A2流转率,A3流转人群,A3流转率,A4流转人群,A4流转率,A5流转人群,A5流转率 > "
-            "[hover]A1流转率/行业TOP5%品牌均值,A2流转率/行业TOP5%品牌均值,A3流转率/行业TOP5%品牌均值,A4流转率/行业TOP5%品牌均值,A5流转率/行业TOP5%品牌均值"
-        ),
-    },
-    "audience_profile_5a": {
-        "label": "投放人群画像-5A人群总资产",
+    # "overview_post_report": {
+    #     "label": "项目整体Overview",
+    #     "required": True,
+    #     "requires_report": True,
+    #     "route_dsl": (
+    #         "活动总览 > [extract]互动率,拉新人群规模,新客人数,新客占比 > "
+    #         "流量分析 > [extract]曝光次数,曝光人数,完播率,完播数,7日回搜人数,7日回搜率 > "
+    #         "转化分析 > [extract]转化金额,转化人数 > "
+    #         "品牌形象 > 搜索分析 > 搜索趋势分析 > [download]"
+    #     ),
+    # },
+    # "asset_5a_flow": {
+    #     "label": "5A人群资产流转",
+    #     "required": True,
+    #     "requires_report": True,
+    #     "route_dsl": (
+    #         "人群分析 > 5A关系资产分析 > 5A人群资产 > "
+    #         "[select]触点=全部/全部 > "
+    #         "[extract]拉新人群规模,拉新比例,A1流转人群,A1流转率,A2流转人群,A2流转率,A3流转人群,A3流转率,A4流转人群,A4流转率,A5流转人群,A5流转率 > "
+    #         "[hover]A1流转率/行业TOP5%品牌均值,A2流转率/行业TOP5%品牌均值,A3流转率/行业TOP5%品牌均值,A4流转率/行业TOP5%品牌均值,A5流转率/行业TOP5%品牌均值"
+    #     ),
+    # },
+    # "人群包投放效果分析": {
+    #     "label": "人群包投放效果分析",
+    #     "required": False,
+    #     "requires_report": True,
+    #     "route_dsl": (
+    #         "人群分析 > 人群画像分析 > 人群包投放效果分析 > [download]"
+    #     ),
+    # },
+    # "audience_profile_5a": {
+    #     "label": "投放人群画像-5A人群总资产",
+    #     "required": False,
+    #     "requires_report": True,
+    #     "route_dsl": (
+    #         "人群分析 > 人群画像分析 > 画像分析 > "
+    #         "[select]5A人群资产=投后 > "
+    #         "[select]触点=params.touchpoint > "
+    #         "5A人群总资产 > [download]"
+    #     ),
+    # },
+    # "audience_profile_a3": {
+    #     "label": "投放人群画像-A3问询",
+    #     "required": False,
+    #     "requires_report": True,
+    #     "route_dsl": (
+    #         "人群分析 > 人群画像分析 > 画像分析 > "
+    #         "[select]5A人群资产=投后 > "
+    #         "[select]触点=params.touchpoint > "
+    #         "A3问询 > [download]"
+    #     ),
+    # },
+    "行业搜索洞察": {
+        "label": "搜索与溢出价值",
         "required": False,
-        "requires_report": True,
+        "requires_report": False,
         "route_dsl": (
-            "人群分析 > 人群画像分析 > 画像分析 > "
-            "[select]5A人群资产=投后 > "
-            "[select]触点=params.touchpoint > "
-            "5A人群总资产 > [download]"
-        ),
-    },
-    "audience_profile_a3": {
-        "label": "投放人群画像-A3问询",
-        "required": False,
-        "requires_report": True,
-        "route_dsl": (
-            "人群分析 > 人群画像分析 > 画像分析 > "
-            "[select]5A人群资产=投后 > "
-            "[select]触点=params.touchpoint > "
-            "A3问询 > [download]"
-        ),
-    },
-    "人群包投放效果分析": {
-        "label": "人群包投放效果分析",
-        "required": False,
-        "requires_report": True,
-        "route_dsl": (
-            "人群分析 > 人群画像分析 > 人群包投放效果分析 > [download]"
+            "营销触点 > 行业搜索洞察 > "
+            "[select]日期类型=params.current_insight.date_range_type > "
+            "[set_date_range]日期=params.current_insight.insight_date_range > "
+            "行业搜索趋势 > "
+            "[extract]搜索次数,搜索人数,搜索次数环比,搜索人数环比 > "
+            "行业核心品牌 > "
+            "[extract]搜索流量SOV排名,搜索流量SOV（指数）"
         ),
     },
     "达人及内容复盘": {
@@ -216,22 +231,10 @@ DSL_MODULE_OVERRIDES: dict[str, dict[str, Any]] = {
         "required": False,
         "requires_report": False,
         "route_dsl": (
-            # "营销触点 > 营销概览 > 爆文加热 > "
-            "[select]=params.kol_content_date_type > "
+            "营销触点 > 营销概览 > 爆文加热 > "
+            "[select]日期类型=params.kol_content_date_type > "
             "[set_date_range]日期=params.kol_content_date_range > "
             "视频榜单 > [download]"
-        ),
-    },
-    "行业搜索洞察": {
-        "label": "搜索与溢出价值",
-        "required": False,
-        "requires_report": False,
-        "route_dsl": (
-            "营销触点 > 行业搜索洞察 > "
-            "[select]=params.current_insight.date_range_type > "
-            "[set_date_range]日期=params.current_insight.insight_date_range > "
-            "行业搜索趋势 > "
-            "[extract]搜索次数,搜索人数,搜索次数环比,搜索人数环比"
         ),
     },
 }
