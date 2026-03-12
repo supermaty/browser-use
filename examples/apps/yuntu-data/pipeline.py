@@ -1255,6 +1255,22 @@ class OptTaskPipeline:
         value = re.sub(r"\s+", "_", value).strip("._ ")
         return value[:120] or "UNKNOWN_REPORT"
 
+    @staticmethod
+    def _merge_value_score(value: Any) -> int:
+        if value in (None, "", [], {}):
+            return 0
+        if isinstance(value, (int, float)):
+            return 1 if float(value) == 0.0 else 2
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return 0
+            compact = text.replace(",", "").replace(" ", "")
+            if compact in {"0", "0.0", "0.00", "0%", "0.0%", "0.00%"}:
+                return 1
+            return 2
+        return 2
+
     @classmethod
     def _deep_merge_dict(cls, base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
         merged = dict(base)
@@ -1269,7 +1285,9 @@ class OptTaskPipeline:
             if isinstance(prev, list) and isinstance(val, list):
                 merged[key] = list(dict.fromkeys([*prev, *val]))
                 continue
-            if prev in (None, "", [], {}):
+            prev_score = cls._merge_value_score(prev)
+            new_score = cls._merge_value_score(val)
+            if prev_score == 0 or new_score > prev_score or (new_score == prev_score and new_score >= 2):
                 merged[key] = val
         return merged
 

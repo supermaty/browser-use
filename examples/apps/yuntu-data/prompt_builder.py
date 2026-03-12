@@ -313,6 +313,11 @@ def _format_insight_cycle_plan(context: dict[str, Any] | None) -> str:
     return "\n".join(lines) if lines else "- (none)"
 
 
+def _module_supports_period(module: Any) -> bool:
+    steps = list(getattr(module, "interaction_steps", None) or [])
+    return any(getattr(step, "op", "") == "set_date_range" for step in steps)
+
+
 def build_agent_prompt(task_intent: YuntuTask, profile: BrandProfileSpec, brand_name_en: str) -> str:
     brand_name = task_intent.brand_name or "UNKNOWN_BRAND"
     targets = _collect_report_targets(task_intent)
@@ -323,6 +328,10 @@ def build_agent_prompt(task_intent: YuntuTask, profile: BrandProfileSpec, brand_
     has_report_modules = bool(report_modules)
     report_module_specs = [m for m in profile.module_specs if m.requires_report]
     global_module_specs = [m for m in profile.module_specs if not m.requires_report]
+    active_module_specs = [*report_module_specs, *global_module_specs]
+    period_module_specs = [m for m in active_module_specs if _module_supports_period(m)]
+    period_module_keys = [m.module_key for m in period_module_specs]
+    has_period_modules = bool(period_module_specs)
     render_context = _intent_context(task_intent)
     report_plan = _format_module_plan(
         report_module_specs,
@@ -334,7 +343,7 @@ def build_agent_prompt(task_intent: YuntuTask, profile: BrandProfileSpec, brand_
         "Global Module DSL Execution Plan",
         context=render_context,
     )
-    insight_cycle_plan = _format_insight_cycle_plan(render_context)
+    insight_cycle_plan = _format_insight_cycle_plan(render_context) if has_period_modules else "- (not applicable for current modules)"
     first_report_line = f"- first_report: `{first_report}`" if has_report_modules else ""
     report_targets_line = f"- report_targets_count: `{report_targets_count}`" if has_report_modules else ""
     pre_report_rule = (
@@ -365,13 +374,46 @@ def build_agent_prompt(task_intent: YuntuTask, profile: BrandProfileSpec, brand_
     prompt_targets = targets if has_report_modules else []
     params_context = render_context.get("params", {}) if isinstance(render_context, dict) else {}
     insight_cycles = list(params_context.get("insight_cycles") or [])
-    insight_ranges_count = len(list(task_intent.insight_time_ranges or []))
-    first_cycle = insight_cycles[0] if insight_cycles else {}
+    insight_ranges_count = len(list(task_intent.insight_time_ranges or [])) if has_period_modules else 0
+    first_cycle = insight_cycles[0] if (has_period_modules and insight_cycles) else {}
     first_current = first_cycle.get("current_insight", {}) if isinstance(first_cycle, dict) else {}
     first_insight_type = first_current.get("date_range_type") if isinstance(first_current, dict) else None
     first_insight_range = first_current.get("insight_date_range") if isinstance(first_current, dict) else None
-    insight_time_ranges_formatted = str(params_context.get("insight_time_ranges_formatted") or "N/A")
+    insight_time_ranges_formatted = str(params_context.get("insight_time_ranges_formatted") or "N/A") if has_period_modules else "N/A"
     inferred_touchpoint = _infer_touchpoint_from_report_name(first_report or task_intent.report_name)
+    period_scope_text = ", ".join(f"`{item}`" for item in period_module_keys) if period_module_keys else "(none)"
+    insight_context_block = (
+        f"""- insight_time_ranges_count: `{insight_ranges_count}`
+- current_insight.date_range_type: `{(first_insight_type or "N/A")}`
+- current_insight.insight_date_range: `{(first_insight_range or "N/A")}`
+- insight_time_ranges_formatted:
+{insight_time_ranges_formatted}"""
+        if has_period_modules
+        else "- insight_cycles_scope: `disabled` (no current module contains `[set_date_range]`)"
+    )
+    insight_rule_block = (
+        f"""16. Insight-cycle mode applies ONLY to modules containing `[set_date_range]`: {period_scope_text}.
+   - For all other modules, ignore `params.insight_cycles`, `current_insight`, `cycle*_current`, and `cycle*_previous`.
+   - If `params.insight_cycles` is not empty:
+     - Iterate cycles in order.
+     - For each cycle: run one pass for `current_insight`; if `previous_insight` exists, run one more pass for it.
+     - For each pass, explicitly use that pass's `date_range_type` + `insight_date_range` (do not reuse first-cycle values).
+     - For each pass, restart that module from interaction step #1 and execute all interaction steps in listed order.
+     - Never jump to a later extract step because a tab looks already active from previous pass.
+     - If a module contains multiple click/extract branches, execute each click + its extract(s) in order per pass.
+     - Keep same field set each pass.
+     - Keep same-field results separated by period and write period-split JSON into `module.period_results`
+       (labels like `cycle1_current`, `cycle1_previous`).
+     - Do not finish task until all labels in `Insight Cycle Concrete Plan` are executed (or marked missing with reason)."""
+        if has_period_modules
+        else "16. Insight-cycle mode is disabled for this run because no current module contains `[set_date_range]`. Ignore `params.insight_cycles/current_insight` completely."
+    )
+    insight_execution_block = (
+        "11 If `params.insight_cycles` is not empty, execute by `params.insight_cycles` (current + previous), and keep same-field results separated by period labels in `module.period_results`.\n"
+        "11.1 For each insight label pass, rerun the full module DSL interaction sequence from step 1 (do not continue from last active tab of previous pass)."
+        if has_period_modules
+        else "11. Skip insight-cycle reruns because no current module contains `[set_date_range]`."
+    )
 
     return f"""
 You are a deterministic Yuntu operator. Complete the workflow in ONE run.
@@ -384,11 +426,7 @@ Fixed context:
 - kol_content_date_type: `{(task_intent.kol_content_date_type or "近30天")}`
 - kol_content_date_range: `{(task_intent.kol_content_date_range or "N/A")}`
 - touchpoint(auto from report_name): `{(inferred_touchpoint or "N/A")}`
-- insight_time_ranges_count: `{insight_ranges_count}`
-- current_insight.date_range_type: `{(first_insight_type or "N/A")}`
-- current_insight.insight_date_range: `{(first_insight_range or "N/A")}`
-- insight_time_ranges_formatted:
-{insight_time_ranges_formatted}
+{insight_context_block}
 
 Hard rules:
 {pre_report_rule}
@@ -458,17 +496,7 @@ Hard rules:
 {report_scope_rule}
 14. Never call file-system tools (`write_file`/`replace_file`/`append_file`/`read_file`) and do not maintain todo/checklist.
 15. Module execution is monotonic: once you start module N+1, never go back to module N.
-16. If `params.insight_cycles` is not empty:
-   - Iterate cycles in order.
-   - For each cycle: run one pass for `current_insight`; if `previous_insight` exists, run one more pass for it.
-   - For each pass, explicitly use that pass's `date_range_type` + `insight_date_range` (do not reuse first-cycle values).
-   - For each pass, restart that module from interaction step #1 and execute all interaction steps in listed order.
-   - Never jump to a later extract step because a tab looks already active from previous pass.
-   - If a module contains multiple click/extract branches, execute each click + its extract(s) in order per pass.
-   - Keep same field set each pass.
-   - Keep same-field results separated by period and write period-split JSON into `module.period_results`
-     (labels like `cycle1_current`, `cycle1_previous`).
-   - Do not finish task until all labels in `Insight Cycle Concrete Plan` are executed (or marked missing with reason).
+{insight_rule_block}
 17. Completion rule (strict):
    - if report modules exist: all `report_targets` must be completed, and for EACH target all `Report modules` must run once;
    - then all `Global modules` must run once;
@@ -498,8 +526,7 @@ B) Data extraction/download (Agent executes DSL + tools collect output)
      b) run ALL `Report modules` in order exactly once for this target;
      c) if report modules finished, return to report list and continue next target.
 10. After all report targets are done (or if no report modules), run ALL `Global modules` once in order.
-11 If `params.insight_cycles` is not empty, execute by `params.insight_cycles` (current + previous), and keep same-field results separated by period labels in `module.period_results`.
-11.1 For each insight label pass, rerun the full module DSL interaction sequence from step 1 (do not continue from last active tab of previous pass).
+{insight_execution_block}
 12. If a module has required steps and they fail, mark module as failed/partial, continue next module/target.
 13. After finishing all targets + all modules, call `done` with short summary only (no large JSON payload).
 
