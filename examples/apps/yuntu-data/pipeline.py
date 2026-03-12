@@ -42,7 +42,7 @@ from schemas import (
 from specs import build_opt_profile, resolve_profile_name
 from tools import create_opt_tools
 
-from prompt_builder import build_single_agent_prompt
+from prompt_builder import build_agent_prompt
 
 
 class OptTaskPipeline:
@@ -2261,7 +2261,9 @@ class OptTaskPipeline:
         module_stage: int = -1
         empty_action_streak: int = 0
         hover_eval_seen_by_stage: set[int] = set()
-        extract_signature_seen_by_stage: dict[int, set[str]] = {}
+        # Allow at most one retry for the same extract signature per stage.
+        # This keeps flow stable while fixing first-pass false negatives.
+        extract_signature_seen_by_stage: dict[int, dict[str, int]] = {}
         pending_click_target: str | None = None
         pending_click_retry_count: int = 0
         recent_success_click_targets: list[str] = []
@@ -2303,7 +2305,9 @@ class OptTaskPipeline:
         module_key_to_stage = {m.module_key: idx for idx, m in enumerate(report_modules)}
         module_route_tokens_by_key: dict[str, list[str]] = {}
         module_has_select_steps: dict[str, bool] = {}
+        module_has_click_steps: dict[str, bool] = {}
         select_route_prereq_rules: list[dict[str, str]] = []
+        click_route_prereq_rules: list[dict[str, str]] = []
         field_key_to_stage: dict[str, int] = {}
         file_key_to_stage: dict[str, int] = {}
         token_to_stages: dict[str, set[int]] = {}
@@ -2313,6 +2317,7 @@ class OptTaskPipeline:
             if module_key:
                 module_route_tokens_by_key[module_key] = route_tokens
             has_select = False
+            has_click = False
             route_tail = route_tokens[-1] if route_tokens else ""
             for step in (getattr(module, "interaction_steps", []) or []):
                 op = str(getattr(step, "op", "") or "").strip()
@@ -2326,8 +2331,18 @@ class OptTaskPipeline:
                             "route_tail": route_tail,
                         }
                     )
+                if op in {"click", "ensure_visible"} and target and route_tail:
+                    has_click = True
+                    click_route_prereq_rules.append(
+                        {
+                            "module_key": module_key,
+                            "target": target,
+                            "route_tail": route_tail,
+                        }
+                    )
             if module_key:
                 module_has_select_steps[module_key] = has_select
+                module_has_click_steps[module_key] = has_click
 
         def _norm_token(value: str | None) -> str:
             text = str(value or "").strip().lower()
@@ -2450,21 +2465,21 @@ class OptTaskPipeline:
             deduped = list(dict.fromkeys([t for t in recent_success_click_targets if str(t).strip()]))
             recent_success_click_targets[:] = deduped[-12:]
 
+        def _next_missing_route_token(route_tokens: list[str]) -> tuple[str | None, int]:
+            if not route_tokens:
+                return None, 0
+            idx = 0
+            for clicked in recent_success_click_targets:
+                if idx >= len(route_tokens):
+                    break
+                if _same_target(clicked, route_tokens[idx]):
+                    idx += 1
+            if idx >= len(route_tokens):
+                return None, idx
+            return route_tokens[idx], idx
+
         def _pick_route_tail_for_select_target(select_target: str | None) -> str | None:
             target = str(select_target or "").strip()
-
-            def _next_missing_route_token(route_tokens: list[str]) -> tuple[str | None, int]:
-                if not route_tokens:
-                    return None, 0
-                idx = 0
-                for clicked in recent_success_click_targets:
-                    if idx >= len(route_tokens):
-                        break
-                    if _same_target(clicked, route_tokens[idx]):
-                        idx += 1
-                if idx >= len(route_tokens):
-                    return None, idx
-                return route_tokens[idx], idx
 
             scored_candidates: list[tuple[int, str]] = []
             explicit_match_seen = False
@@ -2507,6 +2522,43 @@ class OptTaskPipeline:
                         continue
                     scored_candidates.append((progress, next_token))
 
+            if not scored_candidates:
+                return None
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+            return scored_candidates[0][1]
+
+        def _pick_route_tail_for_click_target(click_target: str | None) -> str | None:
+            target = str(click_target or "").strip()
+            if not target:
+                return None
+            matched_module_keys: set[str] = set()
+            for rule in click_route_prereq_rules:
+                if _same_target(target, rule.get("target")):
+                    mk = str(rule.get("module_key") or "").strip()
+                    if mk:
+                        matched_module_keys.add(mk)
+            scored_candidates: list[tuple[int, str]] = []
+            if matched_module_keys:
+                for mk in matched_module_keys:
+                    route_tokens = module_route_tokens_by_key.get(mk, [])
+                    next_token, progress = _next_missing_route_token(route_tokens)
+                    if next_token is None and progress >= len(route_tokens):
+                        continue
+                    if next_token:
+                        scored_candidates.append((100 + progress, next_token))
+            else:
+                # Fallback when click text matching is unreliable:
+                # choose next missing route token from the module that has click steps
+                # and currently has the deepest matched route prefix.
+                for mk, route_tokens in module_route_tokens_by_key.items():
+                    if not module_has_click_steps.get(mk, False):
+                        continue
+                    next_token, progress = _next_missing_route_token(route_tokens)
+                    if not next_token:
+                        continue
+                    if progress <= 0:
+                        continue
+                    scored_candidates.append((progress, next_token))
             if not scored_candidates:
                 return None
             scored_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -2803,8 +2855,9 @@ class OptTaskPipeline:
                         stage_key = _current_stage_key()
                         signature = _extract_signature_for_stage((params or {}).get("query"), stage_key)
                         if signature and _is_report_stage(stage_key):
-                            seen = extract_signature_seen_by_stage.get(stage_key, set())
-                            if signature in seen:
+                            seen_map = extract_signature_seen_by_stage.get(stage_key, {})
+                            attempt_count = int(seen_map.get(signature, 0))
+                            if attempt_count >= 2:
                                 blocked.append(f"{name}:single_pass_extract_already_executed:{signature}")
                                 continue
 
@@ -2982,8 +3035,47 @@ class OptTaskPipeline:
                     ".ant-layout-content .ant-menu-item",
                     ".ant-layout-content a",
                     ".ant-layout-content button",
-                    "span",
                 ]
+
+                def _looks_like_date_range_text(value: str | None) -> bool:
+                    text = str(value or "").strip()
+                    if not text:
+                        return False
+                    # Examples:
+                    # 2026.01.23 ~ 2026.02.14
+                    # 2026-01-23 ~ 2026-02-14
+                    # 2026/01/23-2026/02/14
+                    return bool(
+                        re.search(
+                            r"\d{4}[./-]\d{1,2}[./-]\d{1,2}\s*[~\-至到]+\s*\d{4}[./-]\d{1,2}[./-]\d{1,2}",
+                            text,
+                        )
+                    )
+
+                # Always-on date typing guard:
+                # forbid manual typing for date range; force opening picker by clicking the same control.
+                if actions:
+                    first_name, first_params = _extract_action_name_and_params(actions[0])
+                    if first_name == "input":
+                        typed_text = str((first_params or {}).get("text") or "").strip()
+                        if _looks_like_date_range_text(typed_text):
+                            idx = (first_params or {}).get("index")
+                            try:
+                                output_payload = model_output.model_dump(mode="json", exclude_none=False)
+                                if isinstance(idx, int):
+                                    output_payload["action"] = [{"click": {"index": int(idx)}}]
+                                else:
+                                    output_payload["action"] = [{"wait": {"seconds": 1}}]
+                                rebuilt = type(model_output).model_validate(output_payload)
+                                rebuilt_actions = list(getattr(rebuilt, "action", []) or [])
+                                if rebuilt_actions:
+                                    model_output.action = rebuilt_actions
+                                    log_messages.append(
+                                        "  date_guard: blocked manual date typing; replaced with picker-open action"
+                                    )
+                                    return
+                            except Exception as exc:
+                                log_messages.append(f"  date_guard_injection_failed: {exc}")
 
                 # Always-on minimal route-tail guard:
                 # pre_guard is usually disabled, so enforce route completion for select steps here.
@@ -3023,6 +3115,9 @@ class OptTaskPipeline:
                                     return
                             except Exception as exc:
                                 log_messages.append(f"  click_retry_guard: enforce_route_tail_injection_failed: {exc}")
+                    # Intentionally do not force route-tail injection for click steps.
+                    # Click-step routing is already encoded in DSL order; forcing route tail
+                    # here can cause ping-pong loops between route tail and next click target.
 
                 if not pending_click_target:
                     return
@@ -3119,7 +3214,8 @@ class OptTaskPipeline:
                     if action_name == "extract":
                         signature = _extract_signature_for_stage((action_params or {}).get("query"), stage_key)
                         if signature and _is_report_stage(stage_key):
-                            extract_signature_seen_by_stage.setdefault(stage_key, set()).add(signature)
+                            stage_map = extract_signature_seen_by_stage.setdefault(stage_key, {})
+                            stage_map[signature] = int(stage_map.get(signature, 0)) + 1
 
                     if action_name in {
                         "click_in_content",
@@ -3181,13 +3277,14 @@ class OptTaskPipeline:
                                     f"  result: click target='{target_text}' clicked={clicked_ok} error='{click_error or '-'}'"
                                 )
                                 if target_text and not clicked_ok:
-                                    if _same_target(target_text, pending_click_target):
+                                    retry_target = target_text
+                                    if _same_target(retry_target, pending_click_target):
                                         pending_click_retry_count += 1
                                     else:
-                                        pending_click_target = target_text
+                                        pending_click_target = retry_target
                                         pending_click_retry_count = 0
                                     log_messages.append(
-                                        f"  guard: pending_click_target set to '{target_text}' (click failed, retry_count={pending_click_retry_count})"
+                                        f"  guard: pending_click_target set to '{pending_click_target}' (click failed, retry_count={pending_click_retry_count})"
                                     )
                                 elif target_text and clicked_ok and _same_target(target_text, pending_click_target):
                                     pending_click_target = None
@@ -3419,14 +3516,16 @@ class OptTaskPipeline:
                 allowed_domains=["yuntu.oceanengine.com", "*.oceanengine.com", "oceanengine.com"],
                 args=["--no-proxy-server", "--disable-quic"],
                 env=browser_env,
-                wait_between_actions=0.3,
-                minimum_wait_page_load_time=0.2,
-                wait_for_network_idle_page_load_time=0.35,
+                cross_origin_iframes=False,
+                max_iframes=30,
+                wait_between_actions=0.6,
+                minimum_wait_page_load_time=0.35,
+                wait_for_network_idle_page_load_time=0.6,
             )
             (task_dir / "conversations").mkdir(parents=True, exist_ok=True)
 
             run_agent = Agent(
-                task=build_single_agent_prompt(task_intent, profile, brand_name_en),
+                task=build_agent_prompt(task_intent, profile, brand_name_en),
                 llm=ChatGoogle(
                     model=GEMINI_MODEL,
                     api_key=API_KEY,

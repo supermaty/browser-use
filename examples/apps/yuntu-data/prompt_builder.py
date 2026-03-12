@@ -313,86 +313,7 @@ def _format_insight_cycle_plan(context: dict[str, Any] | None) -> str:
     return "\n".join(lines) if lines else "- (none)"
 
 
-def build_phase_a_prompt(task_intent: YuntuTask, profile: BrandProfileSpec, brand_name_en: str) -> str:
-    brand_name = task_intent.brand_name or "UNKNOWN_BRAND"
-    targets = _collect_report_targets(task_intent)
-    first_report = targets[0] if targets else (task_intent.report_name or "")
-    menu_text = _join_non_empty(list(profile.menu_path or [])) or "营销决策 -> 结案报告"
-
-    return f"""
-You are a web operator for Yuntu navigation.
-
-Goal:
-- Open Yuntu
-- Ensure login state
-- Switch brand to `{brand_name}` (alias: `{brand_name_en}`)
-- Navigate menu: {menu_text}
-- Open first report `{first_report}` in current tab
-
-Preferred way:
-1. Use native page actions only (click/input/search/enter) to navigate/open report.
-2. After entering report list, click and stay on `升级版报告` tab only (never switch to `历史报告` / `全部报告`).
-3. Report-list search must be the table-adjacent search input (NOT top global search).
-4. Exact report match required (allow ignoring trailing punctuation only).
-5. Open report in current tab.
-
-Report targets:
-{_format_targets(targets)}
-"""
-
-
-def build_phase_b_prompt(task_intent: YuntuTask, profile: BrandProfileSpec) -> str:
-    targets = _collect_report_targets(task_intent)
-    report_modules = [m.module_key for m in profile.module_specs if m.requires_report]
-    global_modules = [m.module_key for m in profile.module_specs if not m.requires_report]
-
-    return f"""
-You are a deterministic extractor for Yuntu.
-
-Rules:
-1. Execute module DSL steps agent-first.
-1.1 For each module pass, execute all plain `route_path` nodes in listed order first with native page actions (native click/scroll), then run interaction steps.
-1.2 If a route node cannot be clicked natively after scroll retry, fallback to `click_in_content` for that node.
-1.3 Never start `[select]` / `[set_date_range]` / `[extract]` / `[download]` if the last `route_path` node for that module is not reached.
-1.4 Route-node success evidence must be action-based (native click/scroll effect or `click_in_content_result.clicked=true`); seeing node text alone is NOT success evidence.
-1.5 For explicit DSL `[click]` interaction steps, use `click_in_content(target_text=<dsl target>)`; do NOT use raw `click index`.
-1.6 If browser warns `Element index ... not available`, do NOT refresh-loop; immediately retry with `click_in_content` for that DSL target.
-2. Use native `extract` for `[extract]`.
-2.1 For `[hover]`, use native `evaluate` then native `extract` for the same hover field list.
-   Hover requirements:
-   - Use `[hover]` field semantic text to find the target card/container first.
-   - Parse hover field into semantic anchors (split by delimiters like `/`, `-`, `(`, `)`, `、`, whitespace) and match by conjunction, not single-fragment hit.
-   - Prefer the container that satisfies the most anchors; for multi-anchor fields, require both primary metric anchor and qualifier anchor before accepting.
-   - If only suffix/qualifier anchors match (for example only benchmark phrase), treat as partial match and reject.
-   - If field text contains identifier tokens, lock hover to the container with the same identifier tokens.
-   - Hover only help/question/popover triggers in that container (`?`, help, question, popover/tooltip trigger), never generic icons (`+`, expand, chart, collapse).
-   - Never use broad icon selection like `querySelector('svg')` as hover target.
-   - In the target container, choose the nearest tooltip trigger to the semantic anchor text (shortest geometric distance), not the first matched node.
-   - `evaluate` must return structured evidence (JSON string): `hover_ok`, `matched_container_text`, `matched_trigger_text`, `tooltip_visible`, `tooltip_text`, `matched_anchors`, `missing_anchors`.
-   - Treat hover as success only when `tooltip_visible=true` and `tooltip_text` is non-empty and semantically aligned with the hover field.
-   - If evidence check fails, mark this hover field as missing immediately and continue to next DSL step (no retry loop).
-   - After evidence passes, run native `extract` and accept only values from the visible tooltip/popup context.
-2.2 Use `download_files_by_spec` for `[download]`.
-3. Always set `profile_name` to `{profile.profile_name}` in every tool call.
-4. If current page is not target report detail, recover with native page actions only.
-5. Execute by report target loop in exact order:
-   - open one target report from report list (current tab)
-   - execute report modules in order: {report_modules}
-   - return to report list and continue next target
-6. After ALL report targets are completed, execute global modules once in order: {global_modules}
-7. `run_module_collection` is DISABLED. Never call it.
-8. `extract_fields_by_spec` is DISABLED in report-phase DSL execution. Never call it.
-9. `hover_in_content` is DISABLED in report-phase DSL execution. Never call it.
-10. Return schema-valid JSON only.
-11. After opening each report detail page, run native `extract` once for `计算时间区间` / `计算周期`.
-12. Save that period in memory as `current_report_period` and reuse it for downstream calculations.
-
-Report targets:
-{_format_targets(targets)}
-"""
-
-
-def build_single_agent_prompt(task_intent: YuntuTask, profile: BrandProfileSpec, brand_name_en: str) -> str:
+def build_agent_prompt(task_intent: YuntuTask, profile: BrandProfileSpec, brand_name_en: str) -> str:
     brand_name = task_intent.brand_name or "UNKNOWN_BRAND"
     targets = _collect_report_targets(task_intent)
     first_report = targets[0] if targets else (task_intent.report_name or "")
@@ -479,6 +400,9 @@ Hard rules:
 6.1 `extract_fields_by_spec` is DISABLED in report-phase DSL execution. Never call it.
 6.2 `hover_in_content` is DISABLED in report-phase DSL execution. Never call it.
 6.3 `dropdown_options` is DISABLED. Never call it.
+6.4 During DSL module execution, `navigate` and `go_back` are DISABLED.
+   - Do not jump by URL to module pages.
+   - Position only via DSL route clicks/scrolls and `click_in_content`.
 {report_detail_rule}
    - `[click]/[ensure_visible]` -> for DSL interaction steps use `click_in_content` (target text from DSL); for plain route_path nodes keep native click/scroll first with `click_in_content` fallback.
    - `[select]/[select_path]` -> `select_in_content`
@@ -505,8 +429,24 @@ Hard rules:
 8.2 Stale-index guard:
    - Never use raw `click index` for explicit DSL `[click]` steps.
    - If a raw click fails with index-missing warning, switch to `click_in_content` immediately for the same target; do not repeat refresh attempts.
-9. Single-pass policy: each DSL step runs at most once per pass (per cycle label). If failed, mark missing and continue (no loop retry).
-10. If page drifts to message/notice center, go back once and continue from next DSL step.
+8.3 Step-failure recovery (route-aware, max 2):
+   - If current DSL step fails due to page-positioning issues (`target_not_found` / `menu_target_not_found` / `not_visible` / `download_trigger_not_found`),
+     immediately retry by executing the PREVIOUS DSL step once, then retry current step once.
+   - Keep this back-one-step recovery at most 2 times per module pass.
+   - If still failing after 2 recoveries, mark current step missing/failed and continue to next DSL step/module.
+   - This recovery applies to route/click/select/set_date_range/download positioning failures, not to arbitrary free-form retries.
+9. Single-pass policy: each DSL step runs at most once per pass (per cycle label).
+   Exception for `[extract]/[extract_fields]`: allow ONE immediate retry with the SAME query/field list before any next click/select
+   only when first result is clearly incomplete (e.g. contains `页面未提供`/`未提供`/`N/A`/`null` or obvious placeholder zeros).
+9.1 Download retry ceiling (strict):
+   - If `download_files_by_spec` returns `status=blocked_repeated_failure` or `error=same_file_set_failed_multiple_times` for a file key,
+     do NOT call `download_files_by_spec` again for that same file key in the current module pass.
+   - Mark that download as failed/missing and continue to the next DSL step/module immediately.
+   - Do not perform manual exploratory scroll/click loops after this terminal download error.
+10. If page drifts to message/notice center or 403/error page appears:
+   - Do NOT use `navigate` / `go_back` recovery loops.
+   - Recover by re-running route positioning clicks from the current module route_path start,
+     then continue current DSL step.
 11. Hover rule (generic): find container by field semantics, hover only tooltip/help/question trigger in that container, require visible tooltip, extract from tooltip text only.
 12. Never claim values from memory; final values must come from current extract/tool output.
 13. Keep model output SHORT to avoid MAX_TOKENS:
@@ -518,10 +458,13 @@ Hard rules:
 {report_scope_rule}
 14. Never call file-system tools (`write_file`/`replace_file`/`append_file`/`read_file`) and do not maintain todo/checklist.
 15. Module execution is monotonic: once you start module N+1, never go back to module N.
-16. For module `行业搜索洞察`, if `params.insight_cycles` is not empty:
+16. If `params.insight_cycles` is not empty:
    - Iterate cycles in order.
    - For each cycle: run one pass for `current_insight`; if `previous_insight` exists, run one more pass for it.
    - For each pass, explicitly use that pass's `date_range_type` + `insight_date_range` (do not reuse first-cycle values).
+   - For each pass, restart that module from interaction step #1 and execute all interaction steps in listed order.
+   - Never jump to a later extract step because a tab looks already active from previous pass.
+   - If a module contains multiple click/extract branches, execute each click + its extract(s) in order per pass.
    - Keep same field set each pass.
    - Keep same-field results separated by period and write period-split JSON into `module.period_results`
      (labels like `cycle1_current`, `cycle1_previous`).
@@ -532,13 +475,19 @@ Hard rules:
    - only then call `done` with a SHORT text.
 18. Do not run post-validation/recheck loops after all modules are done.
 19. `done` payload rule: do NOT include large nested JSON/data object in `done`. Keep only short text + success flag.
-20. After opening each report detail page, immediately run native `extract` once for `计算时间区间` / `计算周期`, and keep it in memory as `current_report_period`.
 {report_target_loop_rule}
 
 Execution steps:
 A) {execution_a_title}
-1. Open 'https://yuntu.oceanengine.com/yuntu_brand/ecom/evaluation_brand/history/distribution?aadvid=1703060939338759'
-
+1. Open Yuntu and ensure login state.
+2. Switch brand to `{brand_name}` (alias `{brand_name_en}`) via native page actions.
+3. click `营销决策`
+4. click `结案报告` (or `投后结案`)
+5. click `升级版报告` tab and keep it active
+6. use table-area report search (NOT global top search), input `{first_report}`, just press Enter for search
+7. if results are delayed, wait and retry search in the SAME `升级版报告` tab (do not switch tabs)
+8. open same-row `查看报告` (or `详情`) in current tab
+8.1 immediately run native `extract` to capture `计算时间区间/计算周期`, set `current_report_period`
 
 B) Data extraction/download (Agent executes DSL + tools collect output)
 9. If report modules exist:
@@ -549,7 +498,8 @@ B) Data extraction/download (Agent executes DSL + tools collect output)
      b) run ALL `Report modules` in order exactly once for this target;
      c) if report modules finished, return to report list and continue next target.
 10. After all report targets are done (or if no report modules), run ALL `Global modules` once in order.
-11 For global module `行业搜索洞察`, execute by `params.insight_cycles` (current + previous), and keep same-field results separated by period labels in `module.period_results`.
+11 If `params.insight_cycles` is not empty, execute by `params.insight_cycles` (current + previous), and keep same-field results separated by period labels in `module.period_results`.
+11.1 For each insight label pass, rerun the full module DSL interaction sequence from step 1 (do not continue from last active tab of previous pass).
 12. If a module has required steps and they fail, mark module as failed/partial, continue next module/target.
 13. After finishing all targets + all modules, call `done` with short summary only (no large JSON payload).
 

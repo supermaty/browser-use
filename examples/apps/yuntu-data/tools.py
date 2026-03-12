@@ -931,7 +931,7 @@ def _wait_for_new_file(download_dir: Path, before: dict[Path, float], timeout_se
     return None
 
 
-def _snapshot_download_for_file_key(path: Path, download_dir: Path, file_key: str) -> Path:
+def _snapshot_download_for_file_key(path: Path, download_dir: Path, file_key: str, name_prefix: str | None = None) -> Path:
     """
     Create a stable per-file_key snapshot to avoid ambiguity when the website exports
     same-name files for different modules.
@@ -939,7 +939,14 @@ def _snapshot_download_for_file_key(path: Path, download_dir: Path, file_key: st
     try:
         if not path.exists() or not path.is_file():
             return path
-        safe_key = re.sub(r"[^0-9a-zA-Z_\-]+", "_", str(file_key or "").strip()) or "download"
+        raw_key = str(file_key or "").strip() or "download"
+        # Prefer DSL node before [download] as filename prefix.
+        # If unavailable, fallback to module-like prefix from file_key.
+        module_prefix = re.sub(r"_file(?:_\d+)?$", "", raw_key)
+        base = str(name_prefix or "").strip() or module_prefix or raw_key
+        # Keep Chinese and general unicode chars; only strip filesystem-illegal chars.
+        base = re.sub(r"\s+", "_", base)
+        safe_key = re.sub(r"[<>:\"/\\|?*\x00-\x1f]+", "_", base).strip(" .") or "download"
         stamp = time.strftime("%Y%m%d_%H%M%S")
         target = download_dir / f"{safe_key}_{stamp}{path.suffix}"
         counter = 1
@@ -3149,7 +3156,7 @@ async def _download_files_by_specs(
             )
             continue
 
-        stored_path = _snapshot_download_for_file_key(path, download_dir, spec.file_key)
+        stored_path = _snapshot_download_for_file_key(path, download_dir, spec.file_key, name_prefix=spec.name_prefix)
         outputs.append(
             {
                 "file_key": spec.file_key,
@@ -7267,6 +7274,20 @@ async def _detect_unexpected_global_page(browser_session: BrowserSession) -> dic
 async def _guard_and_recover_unexpected_page(browser_session: BrowserSession) -> dict:
     before = await _detect_unexpected_global_page(browser_session)
     if not before.get("is_unexpected"):
+        # Also treat load-error overlays as recoverable guard failures.
+        page_error_before = await _detect_server_error_state(browser_session)
+        if page_error_before.get("is_error"):
+            recover = await _recover_report_list_page(browser_session)
+            await asyncio.sleep(0.6)
+            after_unexpected = await _detect_unexpected_global_page(browser_session)
+            after_page_error = await _detect_server_error_state(browser_session)
+            recovered = bool(recover.get("recovered")) and (not after_page_error.get("is_error"))
+            return {
+                "ok": recovered and (not after_unexpected.get("is_unexpected")),
+                "recovered": recovered,
+                "before": {"unexpected": before, "page_error": page_error_before},
+                "after": {"unexpected": after_unexpected, "page_error": after_page_error, "recover": recover},
+            }
         return {"ok": True, "recovered": False, "before": before, "after": before}
 
     page = await browser_session.must_get_current_page()
@@ -9446,6 +9467,9 @@ def create_opt_tools(session: TaskSession) -> Tools:
         if not selectors:
             selectors = list(DEFAULT_CONTENT_CLICK_SELECTORS)
 
+        page_before = await browser_session.must_get_current_page()
+        before_url = str(getattr(page_before, "url", "") or "")
+
         clicked = await _click_text_step(
             browser_session=browser_session,
             label=(params.target_text or "").strip(),
@@ -9495,6 +9519,39 @@ def create_opt_tools(session: TaskSession) -> Tools:
                     block_text_tokens=blocked_tokens,
                 )
         await asyncio.sleep(max(0.0, min(float(params.wait_seconds), 2.0)))
+
+        # Guard against false-positive clicks on duplicated text nodes:
+        # for tab/menu-like targets, require observable state change
+        # (URL changed OR selected marker observed for target text).
+        clicked_selector = str(clicked.get("selector") or "").lower()
+        selector_hint_nav = any(
+            tok in str(sel).lower()
+            for sel in selectors
+            for tok in ("role='tab'", "ant-tabs-tab", "role='menuitem'", "ant-menu-item")
+        )
+        target_text_norm = str(params.target_text or "").strip().lower()
+        target_is_date_like = any(tok in target_text_norm for tok in ("日期", "date", "周期", "range"))
+        nav_like = any(tok in clicked_selector for tok in ("role='tab'", "ant-tabs-tab", "role='menuitem'", "ant-menu-item")) or (
+            selector_hint_nav and (not target_is_date_like) and (len(target_text_norm) <= 24)
+        )
+        nav_verify: dict | None = None
+        if clicked.get("clicked") and nav_like and (params.target_text or "").strip():
+            page_after = await browser_session.must_get_current_page()
+            after_url = str(getattr(page_after, "url", "") or "")
+            url_changed = after_url != before_url
+            nav_verify = await _verify_selection_applied(
+                browser_session,
+                target=(params.target_text or "").strip(),
+                value=(params.target_text or "").strip(),
+            )
+            if (not url_changed) and (not bool(nav_verify.get("applied"))):
+                clicked = {
+                    "clicked": False,
+                    "selector": clicked.get("selector"),
+                    "text": clicked.get("text"),
+                    "error": f"click_not_effective:{nav_verify.get('reason') or 'unverified'}",
+                }
+
         post_guard = await _guard_and_recover_unexpected_page(browser_session)
         if clicked.get("clicked"):
             _append_runtime_hints(
@@ -9516,6 +9573,7 @@ def create_opt_tools(session: TaskSession) -> Tools:
                     "selector": clicked.get("selector"),
                     "text": clicked.get("text"),
                     "error": clicked.get("error"),
+                    "verify": nav_verify,
                     "page_guard": {"before": pre_guard, "after": post_guard},
                 },
                 ensure_ascii=False,
