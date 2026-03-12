@@ -2388,7 +2388,7 @@ class OptTaskPipeline:
                         _register_token(stage, str(v))
 
         overview_stage = module_key_to_stage.get("overview_post_report", 0)
-        overview_click_tokens = {"娲诲姩鎬昏", "娴侀噺鍒嗘瀽", "杞寲鍒嗘瀽"}
+        overview_click_tokens = {"活动总览", "流量分析", "转化分析"}
         for module in report_modules:
             if module_key_to_stage.get(module.module_key) != overview_stage:
                 continue
@@ -2691,9 +2691,9 @@ class OptTaskPipeline:
     /\/(message|notice|notification)(\/|$)/.test(lowerUrl) ||
     /#\/?(message|notice|notification)/.test(lowerUrl) ||
     /messagecenter|msg-?center/.test(lowerUrl);
-  const hasMessageLabel = /娑堟伅涓績|娑堟伅閫氱煡|绔欏唴淇閫氱煡涓績/.test(`${title} ${body}`);
+  const hasMessageLabel = /消息中心|消息通知|站内信|通知中心/.test(`${title} ${body}`);
   const isReportLike =
-    /缁撴鎶ュ憡|鎶曞悗缁撴|鎶ュ憡鍒楄〃|娴侀噺鍒嗘瀽|浜虹兢鍒嗘瀽|杞寲鍒嗘瀽|鐢诲儚鍒嗘瀽|5a|钀ラ攢鍐崇瓥/.test(merged) ||
+    /结案报告|投后结案|报告列表|流量分析|人群分析|转化分析|画像分析|5a|营销决策/.test(merged) ||
     /\/(report|post|marketing|decision|insight)/.test(lowerUrl);
   const isUnexpected = !!isMessageRoute || (!!hasMessageLabel && !isReportLike);
   return { url, title, is_report_like: isReportLike, is_unexpected: isUnexpected };
@@ -2767,15 +2767,15 @@ class OptTaskPipeline:
             title = str(getattr(state_summary, "title", "") or "").lower()
             text = f"{url} {title}"
             analysis_tokens = [
-                "娴侀噺鍒嗘瀽",
-                "浜虹兢鍒嗘瀽",
-                "杞寲鍒嗘瀽",
-                "鐢诲儚鍒嗘瀽",
-                "5a鍏崇郴璧勪骇鍒嗘瀽",
+                "流量分析",
+                "人群分析",
+                "转化分析",
+                "画像分析",
+                "5A关系资产分析",
             ]
             if any(tok in text for tok in [t.lower() for t in analysis_tokens]):
                 return True
-            if "缁撴鎶ュ憡" in text and not any(tok in text for tok in [t.lower() for t in analysis_tokens]):
+            if "结案报告" in text and not any(tok in text for tok in [t.lower() for t in analysis_tokens]):
                 return False
             if any(seg in url for seg in ["/report/detail", "/report/view", "/post/report", "/insight/report"]):
                 return True
@@ -3516,7 +3516,7 @@ class OptTaskPipeline:
                 allowed_domains=["yuntu.oceanengine.com", "*.oceanengine.com", "oceanengine.com"],
                 args=["--no-proxy-server", "--disable-quic"],
                 env=browser_env,
-                cross_origin_iframes=False,
+                cross_origin_iframes=True,
                 max_iframes=30,
                 wait_between_actions=0.6,
                 minimum_wait_page_load_time=0.35,
